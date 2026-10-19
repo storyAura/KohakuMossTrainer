@@ -8,6 +8,7 @@ import TerminalPanel from './components/TerminalPanel.vue'
 import ModalsHost from './components/ModalsHost.vue'
 import TrainPage from './pages/TrainPage.vue'
 import ToolsPage from './pages/ToolsPage.vue'
+import LossPage from './pages/LossPage.vue'
 import QueuePage from './pages/QueuePage.vue'
 import ArtifactsPage from './pages/ArtifactsPage.vue'
 import ModelsPage from './pages/ModelsPage.vue'
@@ -17,7 +18,7 @@ onMounted(init)
 onUnmounted(destroy)
 
 const PAGES = {
-  train: ['训练', TrainPage], tools: ['出图 / 导出', ToolsPage], queue: ['队列', QueuePage],
+  train: ['训练', TrainPage], loss: ['Loss 曲线', LossPage], tools: ['出图 / 导出', ToolsPage], queue: ['队列', QueuePage],
   artifacts: ['产物', ArtifactsPage], models: ['模型', ModelsPage],
   env: ['环境', EnvironmentPage],
 }

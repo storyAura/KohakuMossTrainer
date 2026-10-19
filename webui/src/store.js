@@ -395,6 +395,8 @@ let timers = []
 let onKey = null
 
 export async function init() {
+  // ?page=loss 这类网址直接打开那一页
+  store.page = new URLSearchParams(location.search).get('page') || store.page
   document.documentElement.setAttribute('data-theme', store.theme)
   const mq = window.matchMedia('(max-width: 1199px)')
   store.narrow = mq.matches

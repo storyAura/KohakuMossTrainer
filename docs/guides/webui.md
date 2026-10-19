@@ -6,7 +6,10 @@ form becomes a kogine config file, every action a queued job running `kogine run
 ```bash
 kohakumoss-webui                      # http://127.0.0.1:8787, opens the browser
 kohakumoss-webui --port 9000 --no-browser
+kohakumoss-webui --host 0.0.0.0 --port 6008 --no-browser   # a cloud box's service port
 ```
+
+`?page=<name>` in the URL opens that page (`?page=loss`).
 
 The `webui` extra (FastAPI + uvicorn) is part of the `cuda` / `xpu` install sets;
 otherwise `uv pip install -e ".[webui]"`. The built front end (`webui/dist`) is checked
@@ -17,6 +20,7 @@ in; `cd webui && npm install && npm run build` rebuilds it after editing `webui/
 | page | does | command-line equivalent |
 | --- | --- | --- |
 | 训练 (train) | config file bar; algo / data / VRAM / precision / weights layers, knob overrides, datasets; data preparation; train | `kohakumoss-config new train`, `scripts/data/*.py`, `scripts/train/moss.py` |
+| Loss 曲线 (loss) | every metric of a run's `metrics.jsonl` (loss, lr, grad_norm, ...) as curves | - |
 | 出图 / 导出 (tools) | sampling with adapters; exporting a checkpoint | `scripts/sample/sample.py`, `scripts/export/export.py` |
 | 队列 (queue) | every job, its progress, stop | - |
 | 产物 (artifacts) | images, `export/` files and `checkpoints/` of a run directory | - |
@@ -92,6 +96,22 @@ total, each console step line (`step N [loss=... lr=...]`, every `LOG_EVERY` ste
 progress and the loss curve, a tqdm `n/total [` bar the progress of the cache passes.
 The curve's smooth line is an EMA (0.9) of the logged losses. Sample images are read
 from `<OUTPUT_DIR>/<RUN_NAME>/samples/` every 20 s while training runs.
+
+## Loss curves
+
+Every run writes one row per `METRICS_EVERY` steps (default `LOG_EVERY`) to
+`<OUTPUT_DIR>/<RUN_NAME>/metrics.jsonl`; the loss page reads that file, so the curves
+of a past run, or of a run started from the command line, show as well. The run list
+holds every directory under `runs/` (three levels deep) and every run directory the
+server started that has the file. The page asks for the rows after the last byte it
+read every 3 s; a file a new or resumed run rewrote is read again from the start.
+
+- One chart per metric (loss, lr, grad_norm first; the others behind their chips).
+- Range: the whole run or its latest 50 / 20 / 10 %, following new steps; the mouse
+  wheel zooms and dragging pans, every chart together, and stops the following until
+  "恢复跟随".
+- Smoothing (0-99) is an EMA over the loss metrics, as TensorBoard's; the raw curve
+  stays faint behind it.
 
 ## Limits
 

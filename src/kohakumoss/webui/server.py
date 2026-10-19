@@ -26,8 +26,9 @@ from pydantic import BaseModel, Field
 from kohakumoss.cli.config import presets
 from kohakumoss.cli.config.starter import DATA_SCRIPTS
 from kohakumoss.cli.config.validate import SAMPLE, TRAIN, repo_root
+from kohakumoss.logging.sinks import METRICS
 from kohakumoss.memory.profiles import ORDER as PROFILE_ORDER
-from kohakumoss.webui import forms
+from kohakumoss.webui import forms, metrics
 from kohakumoss.webui.jobs import Job, manager
 
 ROOT = repo_root()
@@ -362,6 +363,41 @@ async def job_events(job_id: str):
     )
 
 
+# ---- metrics (the loss page) ----
+
+
+def _run_path(run: str) -> Path:
+    """A run directory from the client: absolute, or relative to the repository; 403
+    outside the repository and the run directories this server started."""
+    path = Path(run)
+    path = (path if path.is_absolute() else ROOT / path).resolve()
+    if not _allowed(path):
+        raise HTTPException(403, "not a run directory of this server")
+    return path
+
+
+@app.get("/api/v1/runs")
+def runs():
+    roots = [ROOT / "runs", *(r for r in ALLOWED if r != ROOT.resolve())]
+    found = metrics.find_runs([r for r in roots if r.is_dir()])
+    return {
+        "runs": [
+            {
+                "path": forms.shown(p, ROOT),
+                "name": p.name,
+                "mtime": (p / METRICS).stat().st_mtime,
+            }
+            for p in found
+        ]
+    }
+
+
+@app.get("/api/v1/metrics")
+def run_metrics(run: str, offset: int = 0):
+    rows, nxt, reset = metrics.read_rows(_run_path(run) / METRICS, max(0, offset))
+    return {"rows": rows, "offset": nxt, "reset": reset}
+
+
 # ---- artifacts ----
 
 
@@ -383,10 +419,7 @@ def _newest(paths, limit: int) -> list[dict]:
 
 @app.get("/api/v1/artifacts")
 def artifacts(run: str):
-    path = Path(run)
-    path = (path if path.is_absolute() else ROOT / path).resolve()
-    if not _allowed(path):
-        raise HTTPException(403, "not a run directory of this server")
+    path = _run_path(run)
     if not path.is_dir():
         return {"run": path.as_posix(), "images": [], "exports": [], "checkpoints": []}
     images = (p for p in path.rglob("*") if p.suffix.lower() in IMAGES)
