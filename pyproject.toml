@@ -43,16 +43,18 @@ quant = ["bitsandbytes"]
 optim = ["prodigyopt", "schedulefree"]
 parquet = ["pyarrow"]
 wandb = ["wandb"]
+webui = ["fastapi>=0.115", "uvicorn>=0.32"]
 dev = ["pytest", "ruff", "black", "lpips", "kohakumoss[bench]"]
 bench = ["matplotlib", "pandas"]
 # default sets per accelerator (docs/guides/install.md)
-cuda = ["kohakumoss[kernels-cuda,lightning,quant]"]
-xpu = ["kohakumoss[kernels-xpu,lightning,quant]"]
+cuda = ["kohakumoss[kernels-cuda,lightning,quant,webui]"]
+xpu = ["kohakumoss[kernels-xpu,lightning,quant,webui]"]
 
 [project.scripts]
 kohakumoss-doctor = "kohakumoss.cli.doctor:main"
 kohakumoss-config = "kohakumoss.cli.config.main:main"
 kohakumoss-tune = "kohakumoss.cli.tune:main"
+kohakumoss-webui = "kohakumoss.webui.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
