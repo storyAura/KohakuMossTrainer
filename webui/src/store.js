@@ -391,6 +391,24 @@ function vramLayer() {
   return fits.length ? Math.max(...fits) + 'g' : Math.min(...sizes) + 'g'
 }
 
+// 打开页面时接上服务器上还在跑的作业(别的标签页、刷新前或命令行提交的),
+// 有训练在跑就把它的配置文件载入表单
+async function resumeActive() {
+  await loadQueue()
+  const live = store.queue.filter(j => ACTIVE.includes(j.status)).reverse()
+  if (!live.length) return
+  const train = live.find(j => j.kind === 'train')
+  if (train?.config) {
+    const path = train.config.replace(/\.py$/, '.json')
+    try {
+      await applyConfig((await getJson('/api/v1/configs/file?path=' + encodeURIComponent(path))).data)
+      store.cfgFile = path
+    } catch { /* 没有存表单(命令行提交的):只接进度 */ }
+  }
+  track(live)
+  log('dim', '[webui] attached to ' + live.length + ' running job(s) · ' + live.map(j => j.kind).join(' → '))
+}
+
 let timers = []
 let onKey = null
 
@@ -415,6 +433,7 @@ export async function init() {
   await recompose()
   if (!store.form.RUN_NAME) store.form = { ...store.form, RUN_NAME: 'my-lora' }
   listConfigs()
+  await resumeActive()
   timers = [
     setInterval(loadEnv, 5000),
     setInterval(() => { if (store.status === 'running' && store.stage === 'train') refreshSamples() }, SAMPLE_POLL_MS),
