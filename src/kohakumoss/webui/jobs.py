@@ -90,8 +90,9 @@ class Job:
         }
 
 
-def parse_progress(progress: dict, line: str) -> bool:
-    """Update `progress` from one log line; True when it changed."""
+def parse_progress(progress: dict, line: str, bars: bool = True) -> bool:
+    """Update `progress` from one log line; True when it changed. `bars` False
+    ignores tqdm bars (a training run's are the sampler's and the decoder's)."""
     if found := RE_TOTAL.search(line):
         progress["total"] = int(found.group(2))
         return True
@@ -101,7 +102,7 @@ def parse_progress(progress: dict, line: str) -> bool:
         if lr := RE_LR.search(line):
             progress["lr"] = _number(lr.group(1))
         return True
-    if found := RE_BAR.search(line):
+    if bars and (found := RE_BAR.search(line)):
         progress["step"], progress["total"] = int(found[1]), int(found[2])
         return True
     return False
@@ -236,10 +237,11 @@ class JobManager:
         kind = line_kind(line)
         if kind == "err":
             job.stderr_tail = (job.stderr_tail + [line])[-STDERR_TAIL:]
-        if parse_progress(job.progress, line):
+        if parse_progress(job.progress, line, bars=job.kind != "train"):
             self._publish_threadsafe(job, {"type": "progress", **job.progress})
-            if RE_BAR.search(line) and not RE_STEP.search(line):
-                return
+        # a tqdm redraw is progress, not a log line
+        if kind != "err" and RE_BAR.search(line) and not RE_STEP.search(line):
+            return
         self._publish_threadsafe(job, {"type": "log", "kind": kind, "text": line})
 
     def cancel(self, job: Job) -> None:

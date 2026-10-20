@@ -179,6 +179,14 @@ def test_parse_progress():
     assert not parse_progress(p, "[INFO] loading weights")
 
 
+def test_parse_progress_ignores_sampler_bars_when_told():
+    p = {"step": 520, "total": 4000, "loss": 0.61, "lr": 2e-4}
+    sampler = " 40%|####      | 14/35 [00:03<00:05,  4.1it/s]"
+    assert not parse_progress(p, sampler, bars=False)
+    assert (p["step"], p["total"]) == (520, 4000)
+    assert parse_progress(p, sampler)
+
+
 def test_line_kind():
     assert line_kind("Traceback (most recent call last):") == "err"
     assert line_kind("[12:00:00] [x] [WARNING] slow disk") == "warn"
