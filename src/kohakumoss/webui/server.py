@@ -165,7 +165,7 @@ def capabilities():
     return {
         "layers": {g: groups["moss"][g] for g in forms.TRAIN_LAYERS},
         "sample_precision": groups["sample"]["precision"],
-        "profiles": [*PROFILE_ORDER, "auto"],
+        "profiles": [*PROFILE_ORDER, "auto", "manual"],
         "config_dir": forms.WEBUI_DIR,
     }
 

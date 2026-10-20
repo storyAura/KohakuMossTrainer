@@ -110,6 +110,8 @@ export const GROUPS = [
       { label: '编译', key: 'COMPILE', type: 'select', options: opt('off', 'block', 'model') },
     ],
     adv: [
+      { label: '检查点', key: 'CHECKPOINT', type: 'text', ph: '默认', hint: '内存方案选 manual 时生效,如 partial:0.2、block、none' },
+      { label: 'token 预算', key: 'TOKEN_BUDGET', type: 'select', options: opt('estimate', 'render', 'exact') },
       { label: '内核调优', key: 'TUNE', type: 'select', options: opt('table', 'off') },
       { label: '内核选择', key: 'KERNELS', type: 'json', hint: '如 {"attention_varlen": "triton"}' },
     ],
