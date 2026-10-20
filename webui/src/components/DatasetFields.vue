@@ -11,7 +11,7 @@ const btn = 'height:32px;padding:0 12px;background:var(--surface);border:1px sol
   <div style="display:flex;flex-direction:column;gap:12px;margin-top:16px">
     <div v-for="(d, i) in store.datasets" :key="i"
       style="display:grid;grid-template-columns:minmax(0,1fr) 88px auto;gap:8px;align-items:center;animation:cardIn .2s ease both">
-      <input :value="d.path" @input="setDataset(i, 'path', $event.target.value)" placeholder="数据集目录(或 jsonl / parquet 文件)" :style="inputStyle + ';width:100%'" />
+      <input :value="d.path" @input="setDataset(i, 'path', $event.target.value)" placeholder="数据集的完整路径,如 /root/data/my_set(或 jsonl / parquet 文件)" :style="inputStyle + ';width:100%'" />
       <input :value="d.weight" @input="setDataset(i, 'weight', $event.target.value)" title="weight:多个数据集时的抽样权重" :style="inputStyle + ';width:88px;text-align:right'" />
       <button @click="removeDataset(i)" :disabled="store.datasets.length <= 1" class="hv-line"
         style="height:34px;padding:0 10px;background:transparent;border:1px solid var(--hairline);border-radius:6px;font-size:12px;color:var(--body);cursor:pointer">移除</button>

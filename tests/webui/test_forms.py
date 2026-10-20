@@ -34,6 +34,8 @@ LAYERS = {
         ('{"factor": 8}', {}, {"factor": 8}),
         ("", None, None),
         ("int8", None, "int8"),
+        (False, None, None),
+        (True, None, True),
     ],
 )
 def test_coerce(value, old, want):
@@ -84,6 +86,15 @@ def test_train_starter_layers_and_datasets():
     assert knobs == compose(root, TRAIN, st.layers, st.own)
     with pytest.raises(forms.FormError):
         forms.train_starter(root, {**form, "layers": {**LAYERS, "algo": "nope"}})
+
+
+def test_tag_switches_leave_nl_captions_alone():
+    root = repo_root()
+    knobs = {"CAPTION.shuffle": False, "CAPTION.tag_dropout": ""}
+    form = {"layers": {**LAYERS, "data": "folder_nl"}, "knobs": knobs}
+    st, composed = forms.train_starter(root, form)
+    assert "CAPTION" not in st.own
+    assert composed["CAPTION"] == {"template": "nl"}
 
 
 def test_weights_layer_sets_layout():

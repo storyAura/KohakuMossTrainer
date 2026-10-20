@@ -76,6 +76,9 @@ def coerce(value, old):
         case dict():
             return value if isinstance(value, dict) else json.loads(value or "{}")
         case None:
+            # a switch that is off for a knob the layers leave unset stays unset
+            if isinstance(value, bool):
+                return value or None
             text = str(value).strip()
             if not text:
                 return None
