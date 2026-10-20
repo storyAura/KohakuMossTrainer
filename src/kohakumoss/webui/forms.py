@@ -24,6 +24,7 @@ from kohakumoss.cli.config.validate import (
     load_knobs,
     problems,
 )
+from kohakumoss.weights.layout import TEXT, VAE, component_path
 
 WEBUI_DIR = "configs/user/webui"
 TRAIN_LAYERS = ("algo", "data", "vram", "precision", "weights")
@@ -222,10 +223,32 @@ def write(root: Path, st: Starter, path: Path) -> Path:
     return path
 
 
+def encoder_source(knobs: dict, component: str, knob: str) -> str:
+    """What a cache pass's encoder loads: the file the train knob `knob` (TEXT_ENCODER /
+    VAE) names, resolved as training resolves it; WEIGHTS when the knob is unset or
+    names no file (the encoder picks its default and reports what is missing)."""
+    if not knobs.get(knob):
+        return knobs["WEIGHTS"]
+    try:
+        found = component_path(
+            knobs["WEIGHTS"], component, knobs[knob], knobs.get("VARIANT", "base")
+        )
+    except FileNotFoundError:
+        return knobs["WEIGHTS"]
+    return str(found)
+
+
 def write_data(root: Path, train_path: Path, knobs: dict, device: str) -> Path:
-    """The data-preparation config beside train config `train_path`."""
+    """The data-preparation config beside train config `train_path`, its encoders on
+    the text-encoder and VAE files the train config uses."""
     choice = TrainChoice(weights=knobs["WEIGHTS"], data="", device=device)
     st = data_starter(choice, train_path)
+    for kwargs, component, knob in (
+        ("TEXT_ENCODER_KWARGS", TEXT, "TEXT_ENCODER"),
+        ("IMAGE_ENCODER_KWARGS", VAE, "VAE"),
+    ):
+        source = posix(encoder_source(knobs, component, knob))
+        st.own[kwargs] = {**st.own[kwargs], "path": source}
     return write(root, st, train_path.with_name(f"{train_path.stem}_data.py"))
 
 

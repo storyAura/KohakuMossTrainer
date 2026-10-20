@@ -7,6 +7,7 @@ import pytest
 from kohakumoss.cli.config.validate import TRAIN, compose, repo_root
 from kohakumoss.webui import forms
 from kohakumoss.webui.jobs import line_kind, parse_progress
+from kohakumoss.weights.layout import TEXT, VAE
 from tests._util.negative import must_fail
 
 LAYERS = {
@@ -95,6 +96,29 @@ def test_tag_switches_leave_nl_captions_alone():
     st, composed = forms.train_starter(root, form)
     assert "CAPTION" not in st.own
     assert composed["CAPTION"] == {"template": "nl"}
+
+
+def test_encoder_source(tmp_path):
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    te = flat / "qwen3.5_9b_bf16.safetensors"
+    te.write_bytes(b"")
+    knobs = {
+        "WEIGHTS": str(flat),
+        "TEXT_ENCODER": str(te),
+        "VAE": "",
+        "VARIANT": "base",
+    }
+    assert forms.encoder_source(knobs, TEXT, "TEXT_ENCODER") == str(te)
+    assert forms.encoder_source(knobs, VAE, "VAE") == str(flat)
+    comfy = tmp_path / "comfy"
+    (comfy / "text_encoders").mkdir(parents=True)
+    named = comfy / "text_encoders" / "qwen3.5_9b_int8_convrot.safetensors"
+    named.write_bytes(b"")
+    knobs = {**knobs, "WEIGHTS": str(comfy), "TEXT_ENCODER": "qwen3.5_9b_int8_convrot"}
+    assert forms.encoder_source(knobs, TEXT, "TEXT_ENCODER") == str(named)
+    missing = {**knobs, "TEXT_ENCODER": "nope"}
+    assert forms.encoder_source(missing, TEXT, "TEXT_ENCODER") == str(comfy)
 
 
 def test_weights_layer_sets_layout():
