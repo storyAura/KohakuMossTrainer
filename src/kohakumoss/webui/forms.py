@@ -247,7 +247,8 @@ def write_data(root: Path, train_path: Path, knobs: dict, device: str) -> Path:
         ("TEXT_ENCODER_KWARGS", TEXT, "TEXT_ENCODER"),
         ("IMAGE_ENCODER_KWARGS", VAE, "VAE"),
     ):
-        source = posix(encoder_source(knobs, component, knob))
+        # absolute but not resolved: a symlinked file keeps its .safetensors name
+        source = Path(encoder_source(knobs, component, knob)).absolute().as_posix()
         st.own[kwargs] = {**st.own[kwargs], "path": source}
     return write(root, st, train_path.with_name(f"{train_path.stem}_data.py"))
 

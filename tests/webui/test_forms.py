@@ -121,6 +121,25 @@ def test_encoder_source(tmp_path):
     assert forms.encoder_source(missing, TEXT, "TEXT_ENCODER") == str(comfy)
 
 
+def test_write_data_keeps_symlinked_encoder_names(tmp_path):
+    blob = tmp_path / "store" / "e39e8f6cbc7754e0"
+    blob.parent.mkdir()
+    blob.write_bytes(b"")
+    flat = tmp_path / "moss"
+    flat.mkdir()
+    link = flat / "qwen3.5_9b_bf16.safetensors"
+    try:
+        link.symlink_to(blob)
+    except OSError:
+        pytest.skip("symlinks need privileges here")
+    train = tmp_path / "configs" / "run.py"
+    train.parent.mkdir()
+    train.write_text("", encoding="utf-8")
+    knobs = {"WEIGHTS": str(flat), "TEXT_ENCODER": str(link), "VAE": ""}
+    text = forms.write_data(tmp_path, train, knobs, "cuda").read_text(encoding="utf-8")
+    assert link.as_posix() in text and blob.name not in text
+
+
 def test_weights_layer_sets_layout():
     root = repo_root()
     _, hf = forms.train_starter(root, {"layers": LAYERS})
