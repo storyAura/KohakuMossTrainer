@@ -137,8 +137,9 @@ def _counting(backend: str | Callable, name: str, key: tuple) -> Callable:
 class CompiledOp:
     """torch.compile of one eager reference op (`EAGER[name]`, or the function `eager`):
     one compiled callable (own code object and Dynamo cache) per call pattern
-    (`_pattern`); a pattern needing more than GRAPH_LIMIT graphs runs the eager
-    reference for the rest of the process (`_limit`, one WARNING, never raised), a
+    (`_pattern`); a pattern needing more than GRAPH_LIMIT graphs builds no more graphs
+    (`_limit`, one WARNING, never raised): its built graphs keep running and other
+    shapes run the eager reference, so a checkpoint recompute matches its forward; a
     build failure of the first call raises `BackendUnavailable`. Inside an
     outer torch.compile the eager reference is traced. `resolved(args)` is the runner of
     `args`' pattern, for callers that bind per pattern themselves.
@@ -176,8 +177,12 @@ class CompiledOp:
         return run
 
     def _run(self, key: tuple, fn: Callable, *args):
-        if torch.compiler.is_compiling() or key in self.limited:
+        if torch.compiler.is_compiling():
             return self.eager(*args)
+        if key in self.limited:
+            # Built graphs keep running; shapes without one run eager.
+            with torch.compiler.set_stance("eager_on_recompile"):
+                return fn(*args)
         try:
             out = fn(*args)
         except torch._dynamo.exc.BackendCompilerFailed as err:
@@ -194,10 +199,10 @@ class CompiledOp:
         return out
 
     def _limit(self, key: tuple, err: GraphLimitError, args):
-        """Call pattern `key` passed GRAPH_LIMIT graphs: it runs the eager reference
-        for the rest of the process (one WARNING), this call included."""
+        """Call pattern `key` passed GRAPH_LIMIT graphs: from now on it builds no
+        graph, shapes without one (this call included) run eager (one WARNING)."""
         self.limited.add(key)
-        log.warning(f"{err}; this call pattern runs the eager reference from now on")
+        log.warning(f"{err}; new shapes of this call pattern run the eager reference")
         return self.eager(*args)
 
     def _compile(self, key: tuple) -> Callable:

@@ -2,7 +2,8 @@
 run the same compiled graph, even when the op's other call patterns (dtype x
 requires_grad x grad mode) exceed Dynamo's recompile limit in between (Dynamo then
 stops running the op's cached graphs and runs it eagerly). A call pattern that needs
-more than GRAPH_LIMIT graphs runs the eager reference from then on and never raises."""
+more than GRAPH_LIMIT graphs builds no more graphs and never raises: its built graphs
+keep running (a checkpointed forward's recompute included), new shapes run eager."""
 
 import itertools
 
@@ -174,3 +175,39 @@ def test_graph_limit_runs_eager(monkeypatch):
     check_limit_runs_eager(monkeypatch)
     monkeypatch.setattr(ops.CompiledOp, "_limit", _raising_limit)
     must_fail(lambda: check_limit_runs_eager(monkeypatch), "the limit raises")
+
+
+def check_limit_keeps_checkpointed_graph(monkeypatch, limit: int = 2) -> None:
+    """Static shapes: a checkpointed call, then other token counts of its call pattern
+    past GRAPH_LIMIT, then the backward: the recompute runs the forward's graph."""
+    torch._dynamo.reset()
+    monkeypatch.setattr(ops, "GRAPH_LIMIT", limit)
+    op = ops.CompiledOp("gated_residual", False, "inductor")
+    x, o, gate, seg = _inputs(40, torch.float32, (True, True, False))
+    out = checkpoint(lambda a, b: op(a, b, gate, seg, 1.0), x, o, use_reentrant=False)
+    for n in range(48, 48 + 8 * (limit + 1), 8):
+        op(*_inputs(n, torch.float32, (True, True, False)), 1.0)
+    assert op.limited, "the pattern never reached the limit"
+    try:
+        out.square().sum().backward()
+    except CheckpointError as err:
+        raise AssertionError(f"recompute differs from the forward: {err}") from err
+
+
+_run = ops.CompiledOp._run
+
+
+def _eager_when_limited(self, key, fn, *args):
+    """The broken variant: a limited pattern runs the eager reference for every shape."""
+    if key in self.limited:
+        return self.eager(*args)
+    return _run(self, key, fn, *args)
+
+
+def test_graph_limit_keeps_checkpointed_graph(monkeypatch):
+    check_limit_keeps_checkpointed_graph(monkeypatch)
+    monkeypatch.setattr(ops.CompiledOp, "_run", _eager_when_limited)
+    must_fail(
+        lambda: check_limit_keeps_checkpointed_graph(monkeypatch),
+        "a limited pattern runs eager for its compiled shapes",
+    )
