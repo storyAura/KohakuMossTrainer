@@ -26,6 +26,7 @@ export const GROUPS = [
       { label: '权重格式', key: 'weights', type: 'layer:weights' },
       { label: '模型权重', key: 'WEIGHTS', type: 'path', hint: 'ComfyUI models 文件夹或 HF 模型目录' },
       { label: '变体', key: 'VARIANT', type: 'seg', options: opt('base', 'sft') },
+      { label: '冻结前 N 个块', key: 'FREEZE_BLOCKS', type: 'num', hint: '0 = 不冻结;共 42 块,如 20 = 只训练 layers.20 起' },
       { label: 'DiT', key: 'TRANSFORMER', type: 'path', ph: '留空 = 按变体自动选', hint: 'diffusion_models/ 下的文件名或路径' },
       { label: '文本编码器', key: 'TEXT_ENCODER', type: 'path', ph: '留空 = 自动选' },
       { label: 'VAE', key: 'VAE', type: 'path', ph: '留空 = 自动选' },

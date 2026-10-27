@@ -54,7 +54,7 @@ __all__ = [
 
 KNOWN = frozenset(
     """WEIGHTS VARIANT ARCH_OVERRIDES TRANSFORMER TEXT_ENCODER TEXT_DEVICE TEXT_ENCODE VAE
-    VAE_ENCODE VAE_DTYPE TRAIN_TEXT_REFINER DATASETS
+    VAE_ENCODE VAE_DTYPE TRAIN_TEXT_REFINER FREEZE_BLOCKS DATASETS
     RESOLUTION_MODE TARGET_AREA SIZE_STEP ASPECT_RANGE UPSCALE MAX_TOKENS BATCH_SIZE
     CAPTION TEXT_DROP LATENT_CACHE TEXT_CACHE CACHE_DTYPE CACHE_DIR CAPTION_VARIANTS FLIP
     NUM_WORKERS SEED ALGO PRESET DIM ALPHA ALGO_KWARGS DORA DORA_DETACH DROPOUT
@@ -231,7 +231,20 @@ def _value_problems(k: dict) -> list[str]:
     if isinstance(retune, bool) or not isinstance(retune, int) or retune < 0:
         p.append(f"RETUNE_STEPS must be an int >= 0, got {retune!r}")
     p += release_problems(k.get("STEP_RELEASE", "none"))
-    return p
+    return p + freeze_problems(k)
+
+
+def freeze_problems(k: dict) -> list[str]:
+    """FREEZE_BLOCKS: an int in [0, depth) of the variant (ARCH_OVERRIDES included)."""
+    n = k.get("FREEZE_BLOCKS", 0)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        return [f"FREEZE_BLOCKS must be an int >= 0 (0 = none), got {n!r}"]
+    if k["VARIANT"] not in PRESETS:
+        return []
+    depth = (k.get("ARCH_OVERRIDES") or {}).get("depth", PRESETS[k["VARIANT"]].depth)
+    if n >= depth:
+        return [f"FREEZE_BLOCKS={n} freezes every joint block (depth {depth})"]
+    return []
 
 
 def validate(k: dict) -> list[str]:

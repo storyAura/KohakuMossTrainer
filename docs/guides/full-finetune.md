@@ -1,7 +1,8 @@
 # Full finetune
 
 `ALGO="full"` trains the backbone's own parameters (the text refiner stays frozen unless
-`TRAIN_TEXT_REFINER=True`). The parameters train in place through `FullTrainable`.
+`TRAIN_TEXT_REFINER=True`; `FREEZE_BLOCKS=N` also keeps joint blocks 0 .. N-1 frozen,
+see [adapters.md](../concepts/adapters.md#targeting)). The parameters train in place through `FullTrainable`.
 
 `configs/moss/_base/base_full.py` follows the MOSS tech report:
 

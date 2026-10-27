@@ -72,6 +72,12 @@ LoRA+ side), registered by kind name, LyCORIS module class and `ALGO` name;
   `name_algo_map`, `module_algo_map`, `exclude_name`, `use_fnmatch`) is used as-is;
   every key is set explicitly on each call, since `LycorisNetwork` keeps presets as
   class state.
+- **Frozen blocks.** `FREEZE_BLOCKS=N` keeps the first N joint blocks (`layers.0` ..
+  `layers.{N-1}`) frozen: their paths are appended to the preset's `exclude_name` (any
+  preset form), so no adapter and no `TRAIN_NORMS` delta is built there. Under
+  `ALGO="full"` the same patterns join the frozen parameter set. N is checked against
+  the variant's depth (42 for MOSS-Image); the value is part of the saved
+  `kohakumoss_spec`, so a training state reloads with the same layers.
 
 On a model whose bases live in quantized or streamed storage, LyCORIS sizes each module
 from the linear's features, and the construction state

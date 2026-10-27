@@ -61,6 +61,13 @@ def _expression(expr: str) -> tuple[dict, list[str]]:
     return {"target_name": names}, norms
 
 
+def frozen_blocks(count: int) -> list[str]:
+    """Path patterns of joint blocks `layers.0` .. `layers.{count-1}` (empty for 0)."""
+    if count <= 0:
+        return []
+    return [rf"layers\.({'|'.join(map(str, range(count)))})\."]
+
+
 def resolve_preset(preset: str | dict, prefix: str) -> tuple[dict, list[str]]:
     """(full LyCORIS preset dict with every key set, norm path patterns) for an
     expression, toml or dict. See docs/internals/adapter-kinds.md."""
