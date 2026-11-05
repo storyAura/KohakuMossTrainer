@@ -133,12 +133,12 @@ def vcvars_script() -> Path | None:
 
 def _run_vcvars(script: Path) -> dict[str, list[str]]:
     """The environment change `script` makes: {VAR: ["prepend" | "set", value]}."""
+    # /u: cmd writes `set` as UTF-16LE on any console code page.
     out = subprocess.run(
-        f'cmd /d /s /c ""{script}" >nul 2>&1 && set"',
+        f'cmd /d /u /s /c ""{script}" >nul 2>&1 && set"',
         capture_output=True,
-        text=True,
         check=False,
-    ).stdout
+    ).stdout.decode("utf-16-le", errors="replace")
     delta: dict[str, list[str]] = {}
     for line in out.splitlines():
         key, sep, value = line.partition("=")

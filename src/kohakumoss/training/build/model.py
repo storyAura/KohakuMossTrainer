@@ -10,6 +10,7 @@ import torch
 
 from kohakumoss.adapters.build.apply import apply as apply_adapters
 from kohakumoss.adapters.build.config import config_from_knobs
+from kohakumoss.adapters.build.presets import frozen_blocks
 from kohakumoss.encoders.specs import cache_specs
 from kohakumoss.encoders.text import QwenTextEncoder, text_plan
 from kohakumoss.encoders.text.encoder import default_auto_memory
@@ -214,7 +215,8 @@ def build_trainable(k: dict, backbone, prec: PrecisionConfig, device):
     """FullTrainable for full FT; otherwise the LyCORIS AdapterSet, its init drawn
     from SEED (independent of every draw before it)."""
     if is_full(k):
-        frozen = () if k["TRAIN_TEXT_REFINER"] else (r"^text_embedder\.",)
+        refiner = () if k["TRAIN_TEXT_REFINER"] else (r"^text_embedder\.",)
+        frozen = (*refiner, *frozen_blocks(k["FREEZE_BLOCKS"]))
         return FullTrainable(backbone, frozen, last_block_qk_norm(backbone.cfg.depth))
     backbone.requires_grad_(False)
     with seeded_rng(k["SEED"], device):

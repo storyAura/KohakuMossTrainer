@@ -36,6 +36,7 @@ VAE_DTYPE = (
     "auto"  # "auto" (bf16 where the card has it, else fp16) | "bf16" | "fp16" | "fp32"
 )
 TRAIN_TEXT_REFINER = False  # adapters/full FT also on the 2 text-refiner blocks
+FREEZE_BLOCKS = 0  # joint blocks layers.0 .. layers.N-1 stay frozen (no adapter, no full-FT grad); 0 = none
 
 # ===================== DATA =====================
 DATASETS = (

@@ -186,3 +186,67 @@ kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_lora_24g_
 ```
 
 Never use `sys.path` hacks in scripts; always import from the installed package.
+
+## Commands
+
+```bash
+pytest                                   # model-free suite; hardware markers skip on missing devices
+pytest tests/webui/test_forms.py -k coerce          # one file / one test
+pytest -m real_weights                   # integration; needs KOHAKUMOSS_WEIGHTS (+ KOHAKUMOSS_DATASET)
+KOHAKUMOSS_TEST_BUDGET=0 pytest tests/kernels       # first run that compiles kernels (no time budget)
+pytest tests/rules                       # repo rules: ASCII, no fp64, torch pin, test names, wheel bundle
+black . && ruff check .
+
+kohakumoss-config new train --weights <dir> --data <dataset>   # writes configs/user/<name>.py + <name>_data.py
+kohakumoss-config check configs/user/<name>.py                 # the train script's own knob checks
+kohakumoss-config list                                         # presets, recipes, memory profiles
+kogine run scripts/data/inspect_data.py  --config configs/user/<name>_data.py
+kogine run scripts/data/cache_text.py    --config configs/user/<name>_data.py
+kogine run scripts/data/cache_latents.py --config configs/user/<name>_data.py
+kogine run scripts/train/moss.py --config configs/user/<name>.py --set LR=2e-4
+kohakumoss-doctor                        # environment, per-arch kernel matrix, what the install lacks
+kohakumoss-webui                         # web UI (extra `webui`); front end: cd webui && npm run build
+```
+
+## How a run is put together
+
+- **Scripts are their knobs.** Every UPPER_CASE global of a `scripts/<...>.py` is a knob;
+  `kogine run` applies the config file and `--set`, then `main()` hands `globals()` to the
+  library (`kohakumoss.training.entry.run`). A config names its target script in its
+  docstring (`target_script`); `cli/config/validate.py` composes script defaults →
+  `use_config` layers → own knobs (`compose`) and runs the script's checks (`problems`).
+- **Configs are layers.** `configs/moss/_base/base_lora.py`, then one file per group in
+  `configs/moss/{algo,data,vram,precision,parallel}`; recipes are pre-composed layer stacks.
+  `cli/config/starter.py` picks the layers for a hardware/algo/data choice and renders
+  the config (`render`, `render_full`); the web UI (`kohakumoss.webui.forms`) reuses it.
+- **Data first, then training.** The data scripts share one data config (the train config
+  plus the cache encoders) and write latent / text vaults keyed by encoder id + compute
+  spec; missing keys only are encoded, so the passes resume. Training with
+  `LATENT_CACHE` / `TEXT_CACHE = "offline"` reads those vaults; the text encoder is loaded
+  at build only to encode the sample prompts.
+- **Outputs:** `<OUTPUT_DIR>/<RUN_NAME>/` holds `metrics.jsonl` (one row per
+  `METRICS_EVERY` step), `log.txt`, `checkpoints/step_XXXXXXXX/` (`trainable.safetensors`,
+  optimizer, rng; `KEEP_LAST`), `samples/step_XXXXXXXX/` + `samples/grid.png`, and
+  `export/`. A fresh run moves an earlier `metrics.jsonl` / `log.txt` aside; `RESUME` keeps
+  the rows up to its step.
+- **Kernels are selected, not dispatched.** `kohakumoss_kernels.registry.resolve` binds one
+  backend per (op, arch, dtype); with `TUNE="table"` a prewarm before step 0 times the
+  candidates per card and stores the decisions, and the first steps retune
+  kernel-vs-compile.
+
+## Known pitfalls
+
+- `KERNELS = {op: backend}` pins a backend with no fallback, on every device: the backbone
+  is first built on CPU, so pinning a GPU-only backend (`triton`) fails at load.
+- The `compile` backend builds up to `GRAPH_LIMIT` (8) graphs per call pattern; past it
+  the built graphs keep running and new shapes run the eager reference. Never switch a
+  whole pattern to eager: a checkpointed block whose forward ran a graph would get an
+  eager recompute, and backward raises `CheckpointError`.
+- `starter.posix()` resolves symlinks: a model store of hash-named blobs (shared model
+  mounts, HF cache) loses the `.safetensors` name, and a ComfyUI-file check that reads the
+  suffix fails. Keep such paths absolute but unresolved.
+- A checkout under a non-ASCII path fails the `tests/cli` checks that written configs
+  are ASCII (they embed absolute paths); clone to an ASCII path.
+- The web UI's job list lives in the server process: restarting it while a job runs
+  breaks the job's output pipe. Front-end-only changes need no restart (`webui/dist` is
+  served from disk).

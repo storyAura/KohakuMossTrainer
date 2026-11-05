@@ -66,6 +66,9 @@ compile backend's first CPU probe, call
   variables) into the process. The result is cached in the kernel cache
   (`toolchain/vcvars.json`) and re-run when Visual Studio changes. The first process pays
   the `vcvars64.bat` run (0.8 s measured on VS 18 / MSVC 14.51); later ones read the cache.
+  The environment is read through `cmd /u` (UTF-16LE): without it `cmd` writes in the
+  console code page, and a UTF-8 console (`chcp 65001`) with a non-ASCII `PATH` entry
+  fails to decode under the system ANSI code page (cp936 on Chinese Windows).
 - `CXX` is set to that `cl`, spelled `cl.EXE`: triton-xpu chooses MSVC flags only for that
   exact name (with `cl.exe` it passes GCC flags to MSVC and every launcher build fails).
   A `CXX` naming another compiler is kept. nvcc's host compiler for TileLang is that

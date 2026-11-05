@@ -65,6 +65,7 @@ class AdapterConfig:
     lr_ratio_up: float = 1.0
     seed: int = 0
     fuse_base_add: bool = True
+    freeze_blocks: int = 0
 
     @property
     def lycoris_algo(self) -> str:
@@ -171,6 +172,7 @@ def config_from_knobs(cfg: dict) -> AdapterConfig:
         backend=(cfg.get("KERNELS", {}) or {}).get("lycoris", "auto"),
         lr_ratio_up=float(cfg.get("LORAPLUS_RATIO", 1.0)),
         seed=int(cfg.get("SEED", 0)),
+        freeze_blocks=int(cfg.get("FREEZE_BLOCKS", 0)),
     )
 
 

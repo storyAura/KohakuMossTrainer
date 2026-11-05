@@ -262,7 +262,13 @@ recompute runs on the autograd thread, whose intra-op thread count differs; the
 recompute then has its own compiled callable instead of recompiling the forward's. A
 pattern that needs more than
 `GRAPH_LIMIT` graphs raises `GraphLimitError`; Dynamo's own recompile limits are raised
-above it, so Dynamo's silent eager fallback is never reached. A build failure of the
+above it, so Dynamo's silent eager fallback is never reached. `CompiledOp` catches it
+(one WARNING) and from then on runs that pattern under
+`torch.compiler.set_stance("eager_on_recompile")`: the graphs already built keep
+running, a shape without one runs eager. Switching the whole pattern to eager instead
+would hand a checkpointed block that ran a graph in its forward an eager recompute in
+the same step (bucketed token counts reach the limit mid-step), and backward raises
+`CheckpointError` (`test_graph_limit_keeps_checkpointed_graph`). A build failure of the
 first call raises `BackendUnavailable`; inside an outer torch.compile the eager
 reference is traced. `CompiledOp.resolved(args)` is the runner of `args`' pattern: a
 kernel-vs-compile op binds it per call key (the device, grad mode, thread count and

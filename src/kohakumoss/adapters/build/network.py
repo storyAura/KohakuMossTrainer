@@ -17,7 +17,7 @@ from lycoris.wrapper import LycorisNetwork
 from torch import nn
 
 from kohakumoss.adapters.build.config import AdapterConfig
-from kohakumoss.adapters.build.presets import resolve_preset
+from kohakumoss.adapters.build.presets import frozen_blocks, resolve_preset
 from kohakumoss.adapters.build.target import NormTarget, Target
 from kohakumoss.adapters.train import norms
 from kohakumoss.adapters.train.tlora import AXES, axis_of
@@ -95,6 +95,8 @@ def build_targets(
 ) -> tuple[list[Target], list[NormTarget]]:
     """LyCORIS modules for every matched linear, and the norms that train directly."""
     preset, norm_patterns = resolve_preset(config.preset, config.prefix)
+    frozen = frozen_blocks(config.freeze_blocks)
+    preset = {**preset, "exclude_name": [*preset["exclude_name"], *frozen]}
     LycorisNetwork.apply_preset(preset)
     kwargs = config.module_kwargs()
     deferred = Deferred(kwargs, config.lycoris_algo)
@@ -126,9 +128,12 @@ def build_targets(
 def build_norms(model: nn.Module, patterns: list[str], config: AdapterConfig):
     """Norm modules whose path matches any pattern; their weights train in fp32."""
     compiled = [re.compile(p) for p in patterns]
+    skipped = [re.compile(p) for p in frozen_blocks(config.freeze_blocks)]
     found = []
     for path, module in model.named_modules():
         if not any(c.match(path) for c in compiled):
+            continue
+        if any(s.match(path) for s in skipped):
             continue
         weight = getattr(module, "weight", None)
         if isinstance(weight, torch.Tensor) and weight.dim() == 1:

@@ -1,7 +1,8 @@
 # Full finetune
 
 `ALGO="full"` trains the backbone's own parameters (the text refiner stays frozen unless
-`TRAIN_TEXT_REFINER=True`). `configs/moss/_base/base_full.py` follows the MOSS tech
+`TRAIN_TEXT_REFINER=True`; `FREEZE_BLOCKS=N` also keeps joint blocks 0 .. N-1 frozen,
+see [adapters.md](../concepts/adapters.md#targeting)). `configs/moss/_base/base_full.py` follows the MOSS tech
 report: Muon + AdamW at 5e-5, weight decay 0.01 off for biases / norms / embedders,
 decay-to-one on the last block's q/k norm weights, gradient clip 1.0, EMA 0.9999.
 
