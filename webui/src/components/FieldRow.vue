@@ -1,67 +1,85 @@
 <script setup>
-// 单个参数行:中文 label + mono 旋钮名徽章 + 按类型渲染的控件 + 校验错误。
+// 单个参数行:中文 label + mono 旋钮名(说明悬停 ⓘ 查看)+ 按类型渲染的控件;改过的字段左侧琥珀标记、
+// 可一键恢复预设值;后端校验问题显示在控件下方。
+import Dropdown from './Dropdown.vue'
+import Icon from './Icon.vue'
+import KvEditor from './KvEditor.vue'
+
 defineProps({ f: { type: Object, required: true } })
 </script>
 
 <template>
-  <div style="display:grid;grid-template-columns:224px minmax(0,1fr);gap:16px;align-items:start">
-    <div style="padding-top:8px">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <span style="font-size:14px;line-height:20px;font-weight:500;color:var(--ink)">{{ f.label }}</span>
-        <span style="font-family:var(--font-mono);font-size:12px;line-height:16px;color:var(--mute)">{{ f.flag }}</span>
+  <div :class="['row', { dirty: f.dirty, bad: f.error }]">
+    <div class="label">
+      <div class="label-top">
+        <span class="name">{{ f.label }}</span>
+        <span v-if="f.hint" class="info" :data-tip="f.hint" data-tip-wrap><Icon name="info" :size="14" /></span>
+        <span v-if="f.dirty" class="chip chip-warning changed">已改</span>
       </div>
-      <div v-if="f.hint" style="font-size:12px;line-height:16px;color:var(--mute);margin-top:2px">{{ f.hint }}</div>
+      <div class="flag mono">{{ f.flag }}</div>
     </div>
-    <div style="min-width:0">
-      <input v-if="f.isPath" :value="f.value" @input="f.onInput" :placeholder="f.ph"
-        style="width:100%;height:36px;padding:0 10px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-family:var(--font-mono);font-size:13px;color:var(--ink);transition:border-color .14s ease,box-shadow .14s ease" />
+    <div class="control">
+      <div class="control-line">
+        <Dropdown v-if="f.isCombo" editable :model-value="f.value" :options="f.options" :invalid="!!f.error"
+          :placeholder="f.ph" @update:model-value="f.onPick" class="combo" />
 
-      <input v-else-if="f.isText" :value="f.value" @input="f.onInput" :placeholder="f.ph"
-        style="width:100%;max-width:320px;height:36px;padding:0 10px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-size:14px;color:var(--ink);transition:border-color .14s ease,box-shadow .14s ease" />
+        <input v-else-if="f.isPath" :value="f.value" @input="f.onInput" :placeholder="f.ph" spellcheck="false"
+          :class="['input', 'mono', { invalid: f.error }]" />
 
-      <input v-else-if="f.isNum" :value="f.value" @input="f.onInput"
-        style="width:148px;height:36px;padding:0 10px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-family:var(--font-mono);font-size:13px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink);transition:border-color .14s ease,box-shadow .14s ease" />
+        <input v-else-if="f.isText" :value="f.value" @input="f.onInput" :placeholder="f.ph" spellcheck="false"
+          :class="['input', { invalid: f.error }]" style="max-width:320px" />
 
-      <input v-else-if="f.isSecret" :value="f.value" @input="f.onInput" type="password" placeholder="secret_ref"
-        style="width:100%;max-width:320px;height:36px;padding:0 10px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-family:var(--font-mono);font-size:13px;color:var(--ink);transition:border-color .14s ease,box-shadow .14s ease" />
+        <input v-else-if="f.isNum" :value="f.value" @input="f.onInput" inputmode="decimal" spellcheck="false"
+          :class="['input', 'mono', { invalid: f.error }]" style="width:160px;text-align:right" />
 
-      <div v-else-if="f.isSelect" style="position:relative;display:inline-block">
-        <select :value="f.value" @change="f.onInput"
-          style="appearance:none;-webkit-appearance:none;min-width:220px;height:36px;padding:0 30px 0 10px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-family:var(--font-mono);font-size:13px;color:var(--ink);cursor:pointer;transition:border-color .14s ease,box-shadow .14s ease">
-          <option v-for="o in f.options" :key="o.v" :value="o.v">{{ o.label || o.v }}</option>
-        </select>
-        <span style="position:absolute;right:10px;top:50%;transform:translateY(-50%);pointer-events:none;font-size:10px;color:var(--mute)">▾</span>
+        <Dropdown v-else-if="f.isSelect" :model-value="f.value" :options="f.options" :invalid="!!f.error"
+          @update:model-value="f.onPick" />
+
+        <div v-else-if="f.isSeg" class="seg">
+          <button v-for="o in f.segs" :key="o.label" :class="{ on: o.active }" @click="o.go">{{ o.label }}</button>
+        </div>
+
+        <KvEditor v-else-if="f.isJson" :text="String(f.value ?? '')" :invalid="!!f.error" @change="f.onPick" />
+
+        <textarea v-else-if="f.isArea" :value="f.value" @input="f.onInput" rows="3" :placeholder="f.ph" spellcheck="false"
+          :class="['input', 'mono', { invalid: f.error }]"></textarea>
+
+        <button v-else-if="f.isOn || f.isOff" :class="['switch', { on: f.isOn }]" @click="f.onToggle"
+          role="switch" :aria-checked="f.isOn" :aria-label="f.label"></button>
+
+        <button v-if="f.dirty && f.onReset" class="btn btn-ghost btn-sm btn-icon reset" @click="f.onReset"
+          :data-tip="'恢复预设值:' + (f.preset === '' ? '(空)' : f.preset)">
+          <Icon name="reset" :size="14" />
+        </button>
       </div>
-
-      <div v-else-if="f.isSeg" style="display:inline-flex;gap:4px;padding:4px;background:var(--surface-2);border-radius:6px">
-        <template v-for="o in f.segs" :key="o.label">
-          <button v-if="o.active" @click="o.go"
-            style="height:28px;padding:0 14px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-size:13px;font-weight:500;color:var(--ink);white-space:nowrap;cursor:pointer;box-shadow:var(--shadow-card);transition:background .14s ease,color .14s ease">{{ o.label }}</button>
-          <button v-else @click="o.go" class="hv-ink"
-            style="height:28px;padding:0 14px;background:transparent;border:1px solid transparent;border-radius:6px;font-size:13px;font-weight:400;color:var(--body);white-space:nowrap;cursor:pointer;transition:background .14s ease,color .14s ease">{{ o.label }}</button>
-        </template>
-      </div>
-
-      <textarea v-else-if="f.isArea" :value="f.value" @input="f.onInput" rows="3" :placeholder="f.ph"
-        style="width:100%;padding:8px 10px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-size:14px;line-height:20px;color:var(--ink);resize:vertical;transition:border-color .14s ease,box-shadow .14s ease"></textarea>
-
-      <div v-else-if="f.isSlider" style="display:flex;align-items:center;gap:12px;height:36px">
-        <input type="range" :value="f.value" @input="f.onInput" :min="f.min" :max="f.max" step="1"
-          style="flex:1;max-width:260px;accent-color:var(--ink);height:4px" />
-        <span style="font-family:var(--font-mono);font-size:13px;color:var(--ink);font-variant-numeric:tabular-nums;min-width:28px;text-align:right">{{ f.value }}</span>
-        <span style="font-family:var(--font-mono);font-size:11px;color:var(--mute)">{{ f.max }}</span>
-      </div>
-
-      <button v-else-if="f.isOn" @click="f.onToggle"
-        style="margin-top:8px;width:36px;height:20px;padding:0;position:relative;background:var(--ink);border:1px solid var(--ink);border-radius:6px;cursor:pointer;transition:background .16s ease,border-color .16s ease">
-        <span style="position:absolute;top:2px;left:18px;width:14px;height:14px;border-radius:4px;background:var(--surface);transition:left .18s cubic-bezier(.2,.8,.2,1)"></span>
-      </button>
-      <button v-else-if="f.isOff" @click="f.onToggle"
-        style="margin-top:8px;width:36px;height:20px;padding:0;position:relative;background:var(--surface-2);border:1px solid var(--hairline);border-radius:6px;cursor:pointer;transition:background .16s ease,border-color .16s ease">
-        <span style="position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:4px;background:var(--hairline-strong);transition:left .18s cubic-bezier(.2,.8,.2,1)"></span>
-      </button>
-
-      <div v-if="f.error" style="font-size:12px;line-height:16px;color:var(--error);margin-top:6px;animation:rowIn .18s ease both">{{ f.error }}</div>
+      <div v-if="f.error" class="error"><Icon name="alert" :size="13" />{{ f.error }}</div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.row {
+  display: grid; grid-template-columns: 236px minmax(0, 1fr); gap: 18px; align-items: start;
+  margin: 0 -12px; padding: 10px 12px; border-left: 2px solid transparent; border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  transition: background var(--t-snap) var(--ease), border-color var(--t-snap) var(--ease);
+}
+.row.dirty { border-left-color: var(--warning); background: var(--warning-soft); }
+.row.bad { border-left-color: var(--error); background: var(--error-soft); }
+.label { padding-top: 7px; min-width: 0; }
+.label-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.name { font-size: 14.5px; line-height: 22px; font-weight: 500; color: var(--ink); }
+.changed { height: 20px; padding: 0 7px; font-size: 11px; }
+.flag { font-size: 12px; line-height: 18px; color: var(--faint); word-break: break-all; }
+.info { display: inline-flex; color: var(--faint); cursor: help; }
+.info:hover { color: var(--primary); }
+.combo { flex: 1; }
+.control { min-width: 0; }
+.control-line { display: flex; align-items: flex-start; gap: 6px; min-height: 38px; }
+.control-line > .input:not([style]) { flex: 1; }
+.control-line > .switch { margin-top: 7px; }
+.control-line > .reset { margin-top: 3px; }
+.reset { color: var(--warning-ink); }
+.error { display: flex; align-items: flex-start; gap: 5px; margin-top: 6px; font-size: 13px; line-height: 19px; color: var(--error-ink); animation: rowIn var(--t-snap) var(--ease) both; }
+.error svg { margin-top: 2px; }
+@media (max-width: 720px) { .row { grid-template-columns: 1fr; gap: 6px; } }
+</style>

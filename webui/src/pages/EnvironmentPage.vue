@@ -2,6 +2,7 @@
 // 环境:GPU(nvidia-smi)、关键包版本,以及完整体检(kohakumoss-doctor,输出在终端)。
 import { computed } from 'vue'
 import { store, submitJob, togglePin } from '../store.js'
+import Icon from '../components/Icon.vue'
 
 const gpuRows = computed(() => (store.env.gpus || []).map((g, i) => ({
   k: 'gpu ' + i,
@@ -9,9 +10,10 @@ const gpuRows = computed(() => (store.env.gpus || []).map((g, i) => ({
   ok: true,
 })))
 const cards = computed(() => [
-  { title: '设备', rows: gpuRows.value.length ? gpuRows.value : [{ k: 'gpu', v: store.env.backend ? '未检测到 NVIDIA GPU' : '后端未连接', ok: false }] },
+  { title: '设备', icon: 'cpu', rows: gpuRows.value.length ? gpuRows.value : [{ k: 'gpu', v: store.env.backend ? '未检测到 NVIDIA GPU' : '后端未连接', ok: false }] },
   {
     title: '运行时',
+    icon: 'layers',
     rows: [
       { k: 'backend', v: store.env.backend ? '已连接' : '未连接 · 运行 kohakumoss-webui', ok: store.env.backend },
       { k: 'python', v: store.env.python || '—', ok: !!store.env.python },
@@ -27,26 +29,34 @@ async function doctor() {
 </script>
 
 <template>
-  <div style="animation:pageIn .24s cubic-bezier(.2,.8,.2,1) both;max-width:1280px;margin:0 auto">
-    <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:24px">
-      <div>
-        <h1 style="margin:0;font-size:20px;line-height:28px;font-weight:600;color:var(--ink)">环境</h1>
-        <p style="margin:4px 0 0;font-size:14px;line-height:20px;color:var(--body)">完整体检会列出这台机器缺什么、以及修复命令。</p>
-      </div>
-      <button @click="doctor" class="hv-fade"
-        style="height:36px;padding:0 16px;background:var(--primary);color:var(--on-primary);border:none;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer">环境体检</button>
+  <div class="page">
+    <div class="page-head">
+      <h1 class="h1">环境</h1>
+      <button @click="doctor" class="btn btn-lg btn-primary" :disabled="!store.env.backend"><Icon name="activity" :size="15" />环境体检</button>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:24px">
-      <section v-for="c in cards" :key="c.title" style="background:var(--surface);border-radius:8px;box-shadow:var(--shadow-card);padding:16px 20px">
-        <h2 style="margin:0 0 14px;font-size:16px;font-weight:600;color:var(--ink)">{{ c.title }}</h2>
-        <div v-for="r in c.rows" :key="r.k" style="display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:32px;border-top:1px solid var(--hairline)">
-          <span style="font-family:var(--font-mono);font-size:12px;color:var(--mute)">{{ r.k }}</span>
-          <span style="display:flex;align-items:center;gap:6px;min-width:0;font-family:var(--font-mono);font-size:13px;color:var(--ink)">
-            <span :style="{ width: '6px', height: '6px', borderRadius: '50%', flexShrink: 0, background: r.ok ? 'var(--accent)' : 'var(--warning)' }"></span>
-            <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.v }}</span>
+    <div class="grid">
+      <section v-for="c in cards" :key="c.title" class="card card-pad">
+        <div class="title"><Icon :name="c.icon" :size="16" /><h2 class="h2">{{ c.title }}</h2></div>
+        <div v-for="r in c.rows" :key="r.k" class="row">
+          <span class="mono k">{{ r.k }}</span>
+          <span class="v">
+            <span :class="['chip', r.ok ? 'chip-success' : 'chip-warning']" style="height:18px;padding:0 6px">
+              <Icon :name="r.ok ? 'check' : 'alert'" :size="11" />
+            </span>
+            <span class="mono text">{{ r.v }}</span>
           </span>
         </div>
       </section>
     </div>
   </div>
 </template>
+
+<style scoped>
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 16px; }
+.title { display: flex; align-items: center; gap: 8px; color: var(--primary); margin-bottom: 10px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 42px; border-top: 1px solid var(--hairline-soft); }
+.k { font-size: 13px; color: var(--faint); }
+.v { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.text { font-size: 13.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 520px) { .grid { grid-template-columns: 1fr; } }
+</style>

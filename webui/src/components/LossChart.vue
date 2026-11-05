@@ -1,13 +1,14 @@
 <script setup>
-// loss 双线图:平滑线(accent 蓝)+ 原始线(浅灰退后),单 y 轴,悬浮 crosshair tooltip。
+// loss 双线图:平滑线(主色蓝)+ 原始线(浅灰退后),单 y 轴,悬浮 crosshair tooltip。series = [{x, raw, s}]。
 import { computed, ref } from 'vue'
-import { store } from '../store.js'
+
+const props = defineProps({ series: { type: Array, required: true }, total: { type: Number, default: 0 } })
 
 const W = 360, H = 168, L = 38, R = 8, T = 10, B = 22
 const hover = ref(null)
 
 const scale = computed(() => {
-  const pts = store.series
+  const pts = props.series
   if (!pts.length) return null
   let lo = Infinity, hi = -Infinity
   for (const p of pts) { lo = Math.min(lo, p.raw, p.s); hi = Math.max(hi, p.raw, p.s) }
@@ -16,10 +17,10 @@ const scale = computed(() => {
 })
 
 // x 轴跨度:总步数未知时退回到已见最大步
-const span = () => Math.max(store.totalSteps, store.series[store.series.length - 1]?.x || 0, 1)
+const span = () => Math.max(props.total, props.series[props.series.length - 1]?.x || 0, 1)
 const xs = x => L + (x / span()) * (W - L - R)
 const ys = y => T + (1 - (y - scale.value.lo) / (scale.value.hi - scale.value.lo)) * (H - T - B)
-const pathOf = key => store.series.map((p, i) => (i ? 'L' : 'M') + xs(p.x).toFixed(1) + ' ' + ys(p[key]).toFixed(1)).join(' ')
+const pathOf = key => props.series.map((p, i) => (i ? 'L' : 'M') + xs(p.x).toFixed(1) + ' ' + ys(p[key]).toFixed(1)).join(' ')
 
 const rawPath = computed(() => scale.value ? pathOf('raw') : '')
 const smoothPath = computed(() => scale.value ? pathOf('s') : '')
@@ -28,11 +29,11 @@ const gridLines = computed(() => {
   const { lo, hi } = scale.value
   return [0, 1, 2, 3].map(i => { const g = lo + (hi - lo) * i / 3; return { y: ys(g), label: g.toFixed(3) } })
 })
-const last = computed(() => store.series[store.series.length - 1])
+const last = computed(() => props.series[props.series.length - 1])
 const tipLeft = computed(() => hover.value ? (xs(hover.value.x) / W) * 100 : 0)
 
 function onMove(e) {
-  const pts = store.series
+  const pts = props.series
   if (!pts.length) return
   const r = e.currentTarget.getBoundingClientRect()
   const rel = (e.clientX - r.left) / r.width * W
@@ -44,11 +45,7 @@ function onMove(e) {
 </script>
 
 <template>
-  <div v-if="!store.series.length"
-    :style="{ height: H + 'px' }"
-    style="display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:12px;color:var(--mute);border:1px dashed var(--hairline);border-radius:8px">
-    等待第一个 step…
-  </div>
+  <div v-if="!props.series.length" class="empty" :style="{ height: H + 'px' }">等待第一个 step…</div>
   <div v-else style="position:relative">
     <svg :viewBox="'0 0 ' + W + ' ' + H" width="100%" :height="H" style="display:block;overflow:visible"
       @mousemove="onMove" @mouseleave="hover = null">
@@ -73,12 +70,12 @@ function onMove(e) {
       left: tipLeft > 60 ? 'auto' : tipLeft + '%',
       right: tipLeft > 60 ? (100 - tipLeft) + '%' : 'auto',
       transform: tipLeft > 60 ? 'translateX(-8px)' : 'translateX(8px)',
-      background: 'var(--surface)', boxShadow: 'var(--shadow-float)', borderRadius: '6px',
+      background: 'var(--surface)', boxShadow: 'var(--shadow-float)', borderRadius: '8px',
       padding: '6px 8px', pointerEvents: 'none', whiteSpace: 'nowrap',
     }">
-      <div style="font-family:var(--font-mono);font-size:11px;color:var(--mute)">step {{ hover.x }}</div>
-      <div style="font-family:var(--font-mono);font-size:12px;color:var(--ink)">smooth {{ hover.s.toFixed(4) }}</div>
-      <div style="font-family:var(--font-mono);font-size:12px;color:var(--body)">raw&nbsp;&nbsp;&nbsp;&nbsp;{{ hover.raw.toFixed(4) }}</div>
+      <div style="font-family:var(--font-mono);font-size: 12px;color:var(--mute)">step {{ hover.x }}</div>
+      <div style="font-family:var(--font-mono);font-size: 13px;color:var(--ink)">smooth {{ hover.s.toFixed(4) }}</div>
+      <div style="font-family:var(--font-mono);font-size: 13px;color:var(--body)">raw&nbsp;&nbsp;&nbsp;&nbsp;{{ hover.raw.toFixed(4) }}</div>
     </div>
   </div>
 </template>

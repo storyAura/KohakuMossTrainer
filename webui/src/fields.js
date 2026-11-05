@@ -7,7 +7,6 @@ const opt = (...vs) => vs.map(v => ({ v }))
 export const GROUPS = [
   {
     key: 'basic', eyebrow: 'BASIC', title: '基础',
-    desc: '算法、显存档位、精度选的是 configs/moss/ 下的预设层;切换后下方参数会按该组合刷新(手动改过的不动)。',
     fields: [
       { label: '训练算法', key: 'algo', type: 'layer:algo', hint: 'full = 全量微调' },
       { label: '显存档位', key: 'vram', type: 'layer:vram', hint: '按显卡显存选;auto 由内存规划器挑' },
@@ -21,22 +20,21 @@ export const GROUPS = [
   },
   {
     key: 'model', eyebrow: 'MODEL', title: '模型',
-    desc: '模型页可一键下载 MOSS-Image-Base 到 models/。',
     fields: [
-      { label: '模型权重', key: 'WEIGHTS', type: 'path', hint: '含 transformer/ text_encoder/ vae/ 的目录' },
+      { label: '模型权重', key: 'WEIGHTS', type: 'path', suggest: 'weights', ph: '选择或输入路径', hint: 'ComfyUI models 目录(diffusion_models/ text_encoders/ vae/)或 HF 目录(transformer/ text_encoder/ vae/)' },
       { label: '变体', key: 'VARIANT', type: 'seg', options: opt('base', 'sft') },
       { label: '冻结前 N 个块', key: 'FREEZE_BLOCKS', type: 'num', hint: '0 = 不冻结;共 42 块,如 20 = 只训练 layers.20 起' },
     ],
     adv: [
-      { label: '文本编码器', key: 'TEXT_ENCODER', type: 'path', ph: '留空 = WEIGHTS/text_encoder' },
-      { label: 'VAE', key: 'VAE', type: 'path', ph: '留空 = WEIGHTS/vae' },
+      { label: 'DiT 文件', key: 'TRANSFORMER', type: 'path', suggest: 'diffusion_models', ph: '自动', hint: '留空按 WEIGHTS 自动找;也可填路径' },
+      { label: '文本编码器', key: 'TEXT_ENCODER', type: 'path', suggest: 'text_encoders', ph: '自动', hint: '留空按 WEIGHTS 自动找;也可填路径' },
+      { label: 'VAE', key: 'VAE', type: 'path', suggest: 'vae', ph: '自动', hint: '留空按 WEIGHTS 自动找;也可填路径' },
       { label: '文本编码器放置', key: 'TEXT_ENCODE.memory', type: 'select', options: opt('auto', 'resident', 'offload', 'stream') },
       { label: '训练 text refiner', key: 'TRAIN_TEXT_REFINER', type: 'toggle' },
     ],
   },
   {
     key: 'dataset', eyebrow: 'DATASET', title: '数据集', custom: 'datasets',
-    desc: '可添加多个数据集;数据格式决定目录怎么读(kohya = <重复次数>_<名字>/ 子目录 + .txt 标签)。',
     fields: [
       { label: '数据格式', key: 'data', type: 'layer:data' },
       { label: '分辨率模式', key: 'RESOLUTION_MODE', type: 'select', options: opt('resize', 'bucket', 'shifted_square', 'square_crop') },
@@ -56,7 +54,6 @@ export const GROUPS = [
   },
   {
     key: 'adapter', eyebrow: 'ADAPTER', title: '网络', hideFor: 'full',
-    desc: 'LyCORIS 适配器;全量微调时不显示。',
     fields: [
       { label: '注入位置', key: 'PRESET', type: 'select', options: opt('attn', 'attn-mlp', 'full-block', 'all') },
       { label: '维度', key: 'DIM', type: 'num' },
@@ -73,7 +70,6 @@ export const GROUPS = [
   },
   {
     key: 'optim', eyebrow: 'OPTIMIZER', title: '优化器与学习率',
-    desc: '学习率调度由 AnySchedule 处理,warmup 单位是步。',
     fields: [
       { label: '优化器', key: 'OPTIMIZER', type: 'select', options: opt('adamw', 'adamw16', 'adamw8bit', 'adamw8bit_kernel', 'muon', 'prodigy', 'schedule_free') },
       { label: '学习率', key: 'LR', type: 'num' },
@@ -92,7 +88,6 @@ export const GROUPS = [
   },
   {
     key: 'objective', eyebrow: 'OBJECTIVE', title: '训练目标',
-    desc: '时间步采样与损失函数。',
     fields: [
       { label: '时间步采样', key: 'TIMESTEP', type: 'select', options: opt('moss', 'uniform', 'logit_normal') },
       { label: '损失函数', key: 'LOSS', type: 'select', options: opt('mse', 'huber', 'l1') },
@@ -102,10 +97,9 @@ export const GROUPS = [
   },
   {
     key: 'memory', eyebrow: 'MEMORY', title: '显存与速度',
-    desc: '显存档位已选好内存方案,这里可以单独覆盖。',
     fields: [
       { label: '内存方案', key: 'MEMORY_PROFILE', type: 'select', options: 'profiles' },
-      { label: '底模精度', key: 'BASE_PRECISION', type: 'select', options: [{ v: '', label: '默认' }, ...opt('compute', 'int8', 'fp8', 'fp8_compute', 'mxfp8', 'quant')] },
+      { label: '底模精度', key: 'BASE_PRECISION', type: 'select', options: [{ v: '', label: '默认' }, ...opt('auto', 'compute', 'int8', 'fp8', 'fp8_compute', 'mxfp8', 'quant')] },
       { label: '编译', key: 'COMPILE', type: 'select', options: opt('off', 'block', 'model') },
     ],
     adv: [
@@ -115,7 +109,6 @@ export const GROUPS = [
   },
   {
     key: 'sampling', eyebrow: 'SAMPLING', title: '训练中采样',
-    desc: '每 N 步用下面的提示词出图,图片在产物页与右侧预览。',
     fields: [
       { label: '每 N 步采样', key: 'SAMPLE_EVERY', type: 'num', hint: '0 = 关闭' },
       { label: '提示词', key: 'SAMPLE_PROMPTS', type: 'lines', hint: '每行一条' },
@@ -131,7 +124,6 @@ export const GROUPS = [
   },
   {
     key: 'save', eyebrow: 'SAVE', title: '保存与导出',
-    desc: '训练结束自动导出到 <输出目录>/<运行名>/export/。',
     fields: [
       { label: '每 N 步保存', key: 'SAVE_EVERY', type: 'num' },
       { label: '保留最近 N 个', key: 'KEEP_LAST', type: 'num' },
@@ -142,9 +134,8 @@ export const GROUPS = [
   },
   {
     key: 'logging', eyebrow: 'LOGGING', title: '日志',
-    desc: 'board = KohakuBoard,wandb 需要先登录。',
     fields: [
-      { label: '记录器', key: 'LOGGER', type: 'select', options: opt('console', 'board', 'wandb') },
+      { label: '记录器', key: 'LOGGER', type: 'select', options: opt('console', 'wandb') },
       { label: '项目名', key: 'PROJECT', type: 'text' },
       { label: '每 N 步打印', key: 'LOG_EVERY', type: 'num' },
     ],

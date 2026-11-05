@@ -4,6 +4,7 @@ import { computed, reactive } from 'vue'
 import { store, submitJob, toast } from '../store.js'
 import { getJson } from '../api.js'
 import FieldRow from '../components/FieldRow.vue'
+import Icon from '../components/Icon.vue'
 
 const sample = reactive({
   precision: 'bf16', WEIGHTS: '', ADAPTERS: '', PROMPTS: '', NEGATIVE: '',
@@ -19,15 +20,17 @@ function mk(model, label, key, type, extra = {}) {
   const v = model[key]
   return {
     label, flag: extra.flag ?? key, hint: extra.hint || '', ph: extra.ph || '', value: v, error: '',
-    options: extra.options || [], min: 0, max: 100,
-    isPath: type === 'path', isText: type === 'text', isNum: type === 'num', isSelect: type === 'select',
-    isArea: type === 'area', isSeg: false, isSlider: false, isSecret: false, segs: [], isOn: false, isOff: false,
-    onInput: ev => { model[key] = ev.target.value }, onToggle: () => {},
+    options: extra.options || [],
+    isCombo: type === 'combo', isPath: type === 'path', isText: type === 'text', isNum: type === 'num', isSelect: type === 'select',
+    isArea: type === 'area', isSeg: false, segs: [], isOn: false, isOff: false,
+    onInput: ev => { model[key] = ev.target.value }, onPick: v => { model[key] = v }, onToggle: () => {},
   }
 }
 
+const weightOptions = computed(() => store.weightDirs.map(w => ({ v: w.path, hint: w.kind === 'hf' ? 'HF' : 'ComfyUI' })))
+
 const sampleFields = computed(() => [
-  mk(sample, '模型权重', 'WEIGHTS', 'path', { ph: store.form.WEIGHTS || 'models/MOSS-Image-Base' }),
+  mk(sample, '模型权重', 'WEIGHTS', 'combo', { ph: store.form.WEIGHTS || 'models/MOSS-Image-Base', options: weightOptions.value }),
   mk(sample, '适配器', 'ADAPTERS', 'area', { hint: '每行一个,路径:强度', ph: 'runs/moss/my-lora/export/my-lora-comfy.safetensors:1.0' }),
   mk(sample, '提示词', 'PROMPTS', 'area', { hint: '每行一条,一条出一张' }),
   mk(sample, '负面提示词', 'NEGATIVE', 'area'),
@@ -42,7 +45,7 @@ const sampleFields = computed(() => [
 ])
 
 const exportFields = computed(() => [
-  mk(exp, '模型权重', 'WEIGHTS', 'path', { ph: store.form.WEIGHTS || 'models/MOSS-Image-Base' }),
+  mk(exp, '模型权重', 'WEIGHTS', 'combo', { ph: store.form.WEIGHTS || 'models/MOSS-Image-Base', options: weightOptions.value }),
   mk(exp, '训练状态', 'ADAPTER', 'path', { hint: '检查点里的 trainable.safetensors' }),
   mk(exp, '输出文件', 'OUT', 'path', { ph: 'lora.safetensors' }),
   mk(exp, '格式', 'FORMAT', 'select', { options: opt(['comfy', 'lycoris', 'merged', 'diffusers']) }),
@@ -67,12 +70,14 @@ async function useLatestExport() {
   const pick = r?.exports.find(e => e.name.endsWith('-comfy.safetensors')) || r?.exports.find(e => e.name.endsWith('.safetensors'))
   if (!pick) return toast('warn', '还没有导出文件 · ' + runDir() + '/export/')
   sample.ADAPTERS = pick.path + ':1.0'
+  toast('info', '已填入 · ' + pick.name)
 }
 
 async function useLatestCheckpoint() {
   const r = await latest()
   if (!r?.checkpoints.length) return toast('warn', '还没有检查点 · ' + runDir() + '/checkpoints/')
   exp.ADAPTER = r.checkpoints[0].path + '/trainable.safetensors'
+  toast('info', '已填入 · ' + r.checkpoints[0].name)
 }
 
 const lines = text => text.split('\n').map(s => s.trim()).filter(Boolean)
@@ -94,40 +99,42 @@ function runExport() {
   submitJob('/api/v1/jobs/export', { knobs: { ...exp, WEIGHTS: weights(exp.WEIGHTS) } }, '导出')
 }
 
-const card = 'background:var(--surface);border-radius:8px;box-shadow:var(--shadow-card);padding:20px 24px 24px'
-const btn = 'height:32px;padding:0 12px;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;font-size:13px;font-weight:500;color:var(--ink);cursor:pointer'
-const primary = 'height:36px;padding:0 16px;background:var(--primary);color:var(--on-primary);border:none;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer'
 </script>
 
 <template>
-  <div style="animation:pageIn .24s cubic-bezier(.2,.8,.2,1) both;max-width:1280px;margin:0 auto">
-    <h1 style="margin:0;font-size:20px;line-height:28px;font-weight:600;color:var(--ink)">出图与导出</h1>
-    <p style="margin:4px 0 24px;font-size:14px;line-height:20px;color:var(--body)">都作为作业排队,日志在终端;出的图在产物页按输出目录查看。</p>
-    <div style="display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start">
-      <section :style="card + ';flex:1 1 560px;min-width:0'">
-        <div style="font-family:var(--font-mono);font-size:12px;letter-spacing:.5px;color:var(--mute)">SAMPLE</div>
-        <h2 style="margin:6px 0 16px;font-size:16px;font-weight:600;color:var(--ink)">用训练成果出图</h2>
-        <div style="display:flex;flex-direction:column;gap:16px">
-          <FieldRow v-for="f in sampleFields" :key="f.label" :f="f" />
-        </div>
-        <div style="display:flex;gap:8px;margin-top:20px">
-          <button @click="useLatestExport" class="hv-border" :style="btn">用当前运行的最新导出</button>
+  <div class="page">
+    <div class="page-head">
+      <h1 class="h1">出图与导出</h1>
+    </div>
+    <div class="cols">
+      <section class="card card-pad" style="flex:1 1 560px;min-width:0">
+        <div class="eyebrow">Sample</div>
+        <h2 class="h2" style="margin-top:4px">用训练成果出图</h2>
+        <div class="divider" style="margin:14px -20px 10px"></div>
+        <div class="fields"><FieldRow v-for="f in sampleFields" :key="f.label" :f="f" /></div>
+        <div class="foot">
+          <button @click="useLatestExport" class="btn btn-soft"><Icon name="download" :size="14" />填入当前运行的最新导出</button>
           <span style="flex:1"></span>
-          <button @click="runSample" class="hv-fade" :style="primary">出图</button>
+          <button @click="runSample" class="btn btn-lg btn-primary" :disabled="!store.env.backend"><Icon name="image" :size="15" />出图</button>
         </div>
       </section>
-      <section :style="card + ';flex:1 1 440px;min-width:0'">
-        <div style="font-family:var(--font-mono);font-size:12px;letter-spacing:.5px;color:var(--mute)">EXPORT</div>
-        <h2 style="margin:6px 0 16px;font-size:16px;font-weight:600;color:var(--ink)">从检查点导出</h2>
-        <div style="display:flex;flex-direction:column;gap:16px">
-          <FieldRow v-for="f in exportFields" :key="f.label" :f="f" />
-        </div>
-        <div style="display:flex;gap:8px;margin-top:20px">
-          <button @click="useLatestCheckpoint" class="hv-border" :style="btn">用当前运行的最新检查点</button>
+      <section class="card card-pad" style="flex:1 1 440px;min-width:0">
+        <div class="eyebrow">Export</div>
+        <h2 class="h2" style="margin-top:4px">从检查点导出</h2>
+        <div class="divider" style="margin:14px -20px 10px"></div>
+        <div class="fields"><FieldRow v-for="f in exportFields" :key="f.label" :f="f" /></div>
+        <div class="foot">
+          <button @click="useLatestCheckpoint" class="btn btn-soft"><Icon name="download" :size="14" />填入当前运行的最新检查点</button>
           <span style="flex:1"></span>
-          <button @click="runExport" class="hv-fade" :style="primary">导出</button>
+          <button @click="runExport" class="btn btn-lg btn-primary" :disabled="!store.env.backend"><Icon name="box" :size="15" />导出</button>
         </div>
       </section>
     </div>
   </div>
 </template>
+
+<style scoped>
+.cols { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.fields { display: flex; flex-direction: column; gap: 2px; }
+.foot { display: flex; align-items: center; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--hairline-soft); flex-wrap: wrap; }
+</style>
