@@ -25,9 +25,9 @@ from pydantic import BaseModel, Field
 
 from kohakumoss.cli.config import presets
 from kohakumoss.cli.config.starter import DATA_SCRIPTS
-from kohakumoss.cli.config.validate import SAMPLE, TRAIN, repo_root
+from kohakumoss.cli.config.validate import SAMPLE, TRAIN, repo_root, warnings_of
 from kohakumoss.memory.profiles import ORDER as PROFILE_ORDER
-from kohakumoss.webui import forms
+from kohakumoss.webui import forms, runs, weights
 from kohakumoss.webui.jobs import Job, manager
 
 ROOT = repo_root()
@@ -168,6 +168,7 @@ def preview(form: TrainForm):
         "path": path.relative_to(ROOT).as_posix(),
         "text": text,
         "problems": forms.check(TRAIN, knobs),
+        "warnings": warnings_of(TRAIN, knobs),
     }
 
 
@@ -361,6 +362,45 @@ def artifacts(run: str):
         "images": _newest(images, 48),
         "exports": _newest(exports, 64),
         "checkpoints": _newest(ckpts, 64),
+    }
+
+
+def _run_path(run: str) -> Path:
+    """The run directory `run` (relative to the repo root); 403 outside the allowed
+    roots, 404 without a metrics.jsonl."""
+    path = Path(run)
+    path = (path if path.is_absolute() else ROOT / path).resolve()
+    if not _allowed(path):
+        raise HTTPException(403, "not a run directory of this server")
+    if not (path / runs.METRICS).is_file():
+        raise HTTPException(404, "no metrics.jsonl in this directory")
+    return path
+
+
+@app.get("/api/v1/weights")
+def weight_folders():
+    return {"weights": weights.find(ROOT)}
+
+
+@app.get("/api/v1/weights/files")
+def weight_files(path: str):
+    folder = Path(path)
+    folder = folder if folder.is_absolute() else ROOT / folder
+    return {"files": weights.files(folder)}
+
+
+@app.get("/api/v1/runs")
+def list_runs():
+    roots = [ROOT / "runs", *(p.parent for p in ALLOWED if p != ROOT.resolve())]
+    return {"runs": runs.find([r for r in roots if r.is_dir()], ROOT.resolve())}
+
+
+@app.get("/api/v1/runs/metrics")
+def run_metrics(run: str, offset: int = 0):
+    path = _run_path(run)
+    return {
+        **runs.rows_after(path, max(0, offset)),
+        **runs.summary(path, ROOT.resolve()),
     }
 
 

@@ -87,6 +87,7 @@ class Job:
             "argv": self.argv[1:],
             "run_dir": self.run_dir,
             "config": self.config,
+            "group": self.group,
         }
 
 

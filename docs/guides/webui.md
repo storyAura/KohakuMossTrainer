@@ -58,6 +58,39 @@ progress and the loss curve, a tqdm `n/total [` bar the progress of the cache pa
 The curve's smooth line is an EMA (0.9) of the logged losses. Sample images are read
 from `<OUTPUT_DIR>/<RUN_NAME>/samples/` every 20 s while training runs.
 
+A data-preparation + training submission is one group of jobs; the queue page and the
+monitor show the group as one entry (status and progress of the step running now).
+
+## Watching a run
+
+The progress card also follows runs the web UI did not start (a command-line `kogine
+run`, a run from before a server restart). `GET /api/v1/runs` lists the directories up to
+three levels under `runs/` (and next to every run directory the server started) that
+hold a `metrics.jsonl`, newest first; a run whose `metrics.jsonl` changed in the last
+120 s is shown as running. `GET /api/v1/runs/metrics?run=<dir>&offset=<byte>` returns
+the rows (`step`, `time`, `loss`, `lr`) of the complete lines past `offset` and the new
+offset, so a poll reads only what was appended; a file shorter than `offset` (a fresh
+run moved the old one aside) is read again from byte 0 with `reset`. The total is the
+last `training from step S to N` line of `log.txt`, scanned incrementally. Rows come
+every `METRICS_EVERY` steps, so the curve of a watched run is as dense as that knob.
+With no web UI job running, the card follows the newest running run (else the newest
+run); picking a run in its list pins it.
+
+## Weights picker
+
+`GET /api/v1/weights` lists the folders the WEIGHTS field offers: `models/` and
+`models/*` in the repository, and `*/models` and `*/ComfyUI/models` in the folder that
+holds the repository (a ComfyUI install next to the checkout). A folder counts when it
+has `transformer/` (HF layout) or `diffusion_models/` (ComfyUI layout); ComfyUI folders
+with a `moss_image*.safetensors` DiT (directly or one level down) and HF folders are
+listed first, the repository's own before the ones beside it. Paths are not resolved, so a symlinked model store keeps its file names.
+The field stays editable for any other path.
+
+`GET /api/v1/weights/files?path=<folder>` lists the `.safetensors` names directly in a
+ComfyUI folder's `diffusion_models/`, `text_encoders/` and `vae/` (names with `moss`
+first), which the TRANSFORMER, TEXT_ENCODER and VAE fields offer for the chosen WEIGHTS;
+empty for an HF folder, whose components are subfolders. Only names are returned.
+
 ## Limits
 
 - The job list lives in the server process; restarting it forgets the jobs (the
