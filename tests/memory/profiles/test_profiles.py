@@ -1,5 +1,7 @@
 """Memory profiles, validation, the memory model and the auto planner."""
 
+from dataclasses import replace
+
 import pytest
 
 from kohakumoss.memory.estimate import (
@@ -36,7 +38,7 @@ def test_quant_resolves_per_arch_and_overrides_apply():
 
 @pytest.mark.parametrize("name", list(PROFILES))
 def test_no_profile_sets_a_precision(name):
-    assert resolve(name, device="cpu").base_precision == "compute"
+    assert resolve(name, device="cpu").base_precision == "auto"
 
 
 def test_invalid_combinations_listed_together():
@@ -65,7 +67,29 @@ def test_unknown_override_rejected():
 
 def test_full_ft_maps_ring_to_swap_and_keeps_dense_base():
     plan = resolve("minimal", device="cpu", trainable_base=True)
-    assert plan.stream == "swap" and plan.base_precision == "compute"
+    assert plan.stream == "swap" and plan.base_precision == "auto"
+
+
+def assert_stream_for_base(resolve_of) -> None:
+    """An explicit ring / swap streams as the base needs: swap for full FT, ring for a
+    frozen base (adapters, inference)."""
+    for asked in ("ring", "swap"):
+        over = {"stream": asked, "stream_resident": 2, "checkpoint": "block"}
+        full = resolve_of("manual", over, "cpu", trainable_base=True)
+        frozen = resolve_of("manual", over, "cpu")
+        served = resolve_of("manual", over, "cpu", trainable_base=True, inference=True)
+        assert (full.stream, frozen.stream, served.stream) == ("swap", "ring", "ring")
+        assert validate(frozen) == [] and validate(full, trainable_base=True) == []
+
+
+def _as_asked(profile, overrides, device, trainable_base=False, inference=False):
+    plan = resolve(profile, overrides, device, trainable_base, inference)
+    return replace(plan, stream=overrides["stream"])
+
+
+def test_explicit_stream_takes_the_mode_of_its_base():
+    assert_stream_for_base(resolve)
+    must_fail(lambda: assert_stream_for_base(_as_asked), "an explicit stream kept")
 
 
 def test_inference_drops_activation_knobs_and_allows_streaming():

@@ -10,7 +10,7 @@ The knobs are named and valued as scripts/train/moss.py's.
         --set OUT=out/samples
     kogine run scripts/sample/sample.py --config <sample config> --set TEXT_DEVICE=cpu
     kogine run scripts/sample/sample.py --config <sample config> \
-        --set TEXT_ENCODE={"memory":"stream","precision":"int8"} --set MEMORY_PROFILE=low
+        --set TEXT_ENCODE={"memory":"ring","precision":"int8"} --set MEMORY_PROFILE=low
 
 The text encoder follows TEXT_ENCODE (TextEncoderPlan fields; docs/internals/text-encoder.md),
 the VAE VAE_ENCODE (VaePlan fields; docs/internals/offload.md#vae); an unset memory of
@@ -36,44 +36,43 @@ from kohakumoss.inference.placement_report import forward_tokens
 from kohakumoss.logging.log import get_logger, hl, setup
 from kohakumoss.offload.accel import configure_allocator
 from kohakumoss_common.knobs import prompt_list
+from kohakumoss_kernels import compile_setup
 
 log = get_logger("scripts.sample")
 
 # ===================== MODEL =====================
-WEIGHTS = ""  # weights root (base/, sft/) or one pipeline dir
-VARIANT = (
-    "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists
-)
-TRANSFORMER = ""  # DiT override (file / dir, e.g. an fp16-fix checkpoint); "" = WEIGHTS
+WEIGHTS = ""  # ComfyUI models folder (diffusion_models/, text_encoders/, vae/) | HF weights root (base/, sft/) | one pipeline dir
+VARIANT = "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists (ComfyUI: the DiT file moss_image_<VARIANT>_*)
+TRANSFORMER = ""  # DiT override (file / dir, e.g. an fp16-fix checkpoint; ComfyUI folder: a file name under diffusion_models/); "" = WEIGHTS (ComfyUI: the int8 ConvRot file, else bf16)
+TEXT_ENCODER = ""  # "" = WEIGHTS' text encoder (ComfyUI: qwen3.5_9b_int8_convrot, else _bf16, else _w4a8_gptq) | a file name under text_encoders/ | a path
+VAE = ""  # "" = WEIGHTS' VAE (ComfyUI: flux2-vae_small, else flux2-vae) | a file name under vae/ | a path
 ADAPTERS = []  # [(path, multiplier), ...] or "path[:multiplier]" strings
 ADAPTER_MODE = "merge"  # "merge" | "bypass"
 PRECISION = "bf16"  # compute dtype: "bf16" | "fp16" | "fp32" | "auto" (bf16 where supported, else fp16)
 FP16_FIX = "none"  # "none" | "online" | "fp32_residual" (an fp16-fix TRANSFORMER carries its fold)
 FP16_FIX_KWARGS = {}  # e.g. {"c": 0.0625, "clamp": True}
-TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored; no prewarm)
+TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored)
 
 # ===================== DEVICES =====================
 DEVICE = "cuda"
 TEXT_DEVICE = ""  # text encoder device, e.g. "cpu"; "" = DEVICE
 TEXT_ENCODE = {}  # TextEncoderPlan fields, as in training:
-#   "memory": "auto" (default) | "resident" | "offload" | "stream" | "cpu"; "dtype": "auto" | "bf16" | "fp16"
-#   "precision": "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"; "quant_group", "fp8_recipe", "layout", "stored", ...
+#   "memory": "auto" (default) | "resident" | "offload" | "ring" | "cpu"; "dtype": "auto" | "bf16" | "fp16"
+#   "precision": "auto" (what the weights store) | "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"; "w4a8": "auto" | "int8" | "packed"; "quant_group", "fp8_recipe", "layout", "stored", ...
 #   "free_after_use": True drops the text encoder after its first pass
 VAE_ENCODE = (
     {}
-)  # VaePlan fields, as in training: "memory": "auto" (default) | "resident" | "offload" | "stream" | "cpu"; "tile": True (tiled decode)
-VAE_DTYPE = "auto"  # "auto" (bf16, fp16 without bf16) | "bf16" | "fp16" | "fp32"
+)  # VaePlan fields, as in training: "memory": "auto" (default) | "resident" | "offload" | "ring" | "cpu"; "tile": True (tiled decode)
+VAE_DTYPE = "auto"  # "auto" (bf16, fp16 on fp16-only GPUs) | "bf16" | "fp16" | "fp32"
 MEMORY_PROFILE = ""  # DiT memory profile: "" (resident) | a catalog profile | "speed" | "balanced" | "low" | "minimal" | "manual" | "auto" (the fastest that fits)
 MEMORY_OVERRIDES = {}  # MemoryPlan fields
 # MEMORY_PROFILE="manual": these set the DiT placement (None = the default in brackets); with a profile they stay None.
-# Inference has no backward, so checkpointing, activation and optimizer knobs do not apply here.
 STREAM = None  # "off" (resident) | "ring" (block weights streamed through device slots)  [off]
 STREAM_RESIDENT = None  # device block slots when streaming (>= 2)  [0]
 PINNED = None  # pinned host memory for the streamed weights  [True]
-BASE_PRECISION = (
-    "compute"  # DiT base: "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"
-)
+BASE_PRECISION = "auto"  # DiT base: "auto" (what the DiT file stores) | "compute" (16-bit; a quantized file dequantized) | "int8" | "fp8" | "fp8_compute" | "mxfp8"
 FP8_RECIPE = "row"  # fp8_compute scaling: "tensor" | "row" | "block"
+INT8_COMPUTE = False  # int8 bases run int8 GEMMs (activations quantized per row), not weight-only; CUDA
 
 # ===================== PROMPTS =====================
 PROMPT = ""  # one prompt
@@ -92,7 +91,7 @@ CFG = 3.0
 SHIFT = 5.0
 SKIP_LAYERS = "default"  # negative-branch skipped blocks: "default" | "none" | "22,23"
 CFG_MODE = "packed"  # "packed" | "two_pass"
-BATCH = 4  # prompts per generate batch
+BATCH = 4  # prompts per packed varlen forward (mixed sizes); 0 = all prompts
 
 # ===================== OUTPUT =====================
 OUT = ""  # output directory
@@ -126,13 +125,16 @@ def load_items(k: dict) -> list[dict]:
 def main() -> None:
     setup()
     k = knobs.check(globals())
-    log.info(f"allocator {hl(configure_allocator(k['DEVICE']))}")
+    allocator = configure_allocator(k["DEVICE"])
+    log.info(f"allocator {hl(allocator)}, compile pool: {hl(compile_setup.apply())}")
     items = load_items(k)
     memory, overrides = knobs.memory_of(k)
     pipe = MossPipeline.from_pretrained(
         k["WEIGHTS"],
         variant=k["VARIANT"],
         transformer=k["TRANSFORMER"] or None,
+        text_encoder_file=k["TEXT_ENCODER"],
+        vae_file=k["VAE"],
         dtype=knobs.compute_dtype(k["PRECISION"], k["DEVICE"]),
         device=k["DEVICE"],
         adapters=[knobs.parse_adapter(a) for a in k["ADAPTERS"]],
@@ -148,7 +150,7 @@ def main() -> None:
         vae_dtype=resolve_vae_dtype(k["VAE_DTYPE"], k["DEVICE"]),
         forward_tokens=forward_tokens(
             [it["size"] for it in items],
-            min(k["BATCH"], len(items)),
+            min(k["BATCH"] or len(items), len(items)),
             k["CFG"],
             k["CFG_MODE"],
         ),

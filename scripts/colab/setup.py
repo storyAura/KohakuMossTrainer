@@ -1,6 +1,6 @@
 """Set up KohakuMoss on a Google Colab VM: a uv venv with the torch build matching the
 driver's CUDA, the package extras, an optional editable LyCORIS checkout, then the
-doctor report. Runs with the VM's system Python; nothing is installed into it but uv.
+doctor report. Runs with the VM's system Python; only uv is installed into it.
 See docs/guides/install.md (Google Colab).
 
     python scripts/colab/setup.py
@@ -18,6 +18,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 TORCH_INDEX = ((13, 0, "cu130"), (12, 8, "cu128"), (12, 6, "cu126"))
+CUDA_RE = re.compile(r"CUDA (?:UMD )?Version:\s*(\d+)\.(\d+)")
 BUILD_TOOLS = ("setuptools", "wheel", "ninja", "packaging")
 
 
@@ -27,17 +28,24 @@ def run(cmd: list[str], check: bool = True) -> int:
     return subprocess.run(cmd, check=check).returncode
 
 
+def parse_cuda(text: str) -> tuple[int, int] | None:
+    """(major, minor) of nvidia-smi's "CUDA Version: X.Y" (or, on newer drivers, "CUDA
+    UMD Version: X.Y") header field; None when `text` has neither."""
+    found = CUDA_RE.search(text)
+    return None if found is None else (int(found[1]), int(found[2]))
+
+
 def driver_cuda() -> tuple[int, int]:
     """Highest CUDA version the installed driver supports, from nvidia-smi."""
     out = subprocess.run(
         ["nvidia-smi"], capture_output=True, text=True, check=True
     ).stdout
-    found = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
+    found = parse_cuda(out)
     if found is None:
         raise SystemExit(
             "nvidia-smi reports no CUDA version: is a GPU runtime attached?"
         )
-    return int(found[1]), int(found[2])
+    return found
 
 
 def torch_index(cuda: tuple[int, int]) -> str:
@@ -114,7 +122,7 @@ def main():
         "--torch", default=torch_requirement(), help="torch requirement (pyproject's)"
     )
     ap.add_argument("--torch-index", default="", help="wheel index; '' = by driver")
-    ap.add_argument("--extras", default="kernels,lightning,quant,dev,bench")
+    ap.add_argument("--extras", default="kernels,quant,dev,bench")
     ap.add_argument("--lycoris", default="", help="LyCORIS checkout to install -e")
     ap.add_argument("--doctor-json", default="", help="also write the doctor report")
     args = ap.parse_args()

@@ -1,6 +1,6 @@
-"""VAE placement for training and sampling: resident, offloaded per pass, streamed per
-block, or on the host, chosen by a VaePlan; the encode-ahead pass and sample decodes
-run under the same placement. See docs/internals/offload.md#vae."""
+"""VAE placement for training and sampling: resident, offloaded per pass, its blocks
+through layer rings, or on the host, chosen by a VaePlan; the encode-ahead pass and
+sample decodes run under the same placement. See docs/internals/offload.md#vae."""
 
 import time
 from collections.abc import Sequence
@@ -9,8 +9,7 @@ from dataclasses import dataclass, fields, replace
 import torch
 from torch import Tensor, nn
 
-from kohakumoss.offload.accel import module as accel
-from kohakumoss.offload.accel import streamed, with_index
+from kohakumoss.offload.accel import free_bytes, streamed, with_index
 from kohakumoss.offload.encoders.placement import HostCopies
 from kohakumoss.offload.weights.layers import (
     LayerStreamer,
@@ -19,8 +18,11 @@ from kohakumoss.offload.weights.layers import (
     tensor_ids,
 )
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.hardware.current import on_device
+from kohakumoss_kernels.hardware.host_gemm import host_gemm
 
-MEMORY = ("resident", "offload", "stream", "cpu", "auto")
+MEMORY = ("resident", "offload", "ring", "cpu", "auto")
+MEMORY_ALIASES = {"stream": "ring"}
 COMPILE = ("auto", "on", "off")
 ACT_BYTES_PER_PIXEL = 1024
 
@@ -50,20 +52,24 @@ def compiles(plan: VaePlan, device: torch.device) -> bool:
 
 
 def vae_plan(spec: dict | VaePlan | None = None) -> VaePlan:
-    """A VaePlan from a plan or a dict of its fields; raises listing unknown fields."""
+    """A VaePlan from a plan or a dict of its fields, with `memory` in its primary
+    spelling (`MEMORY_ALIASES`: "stream" is "ring"); raises listing unknown fields."""
     if isinstance(spec, VaePlan):
-        return spec
-    values = dict(spec or {})
-    known = {f.name for f in fields(VaePlan)}
-    unknown = sorted(set(values) - known)
-    if unknown:
-        raise ValueError(f"unknown VAE plan fields {unknown}; valid {sorted(known)}")
-    return VaePlan(**values)
+        plan = spec
+    else:
+        values = dict(spec or {})
+        known = {f.name for f in fields(VaePlan)}
+        unknown = sorted(set(values) - known)
+        if unknown:
+            raise ValueError(
+                f"unknown VAE plan fields {unknown}; valid {sorted(known)}"
+            )
+        plan = VaePlan(**values)
+    return replace(plan, memory=MEMORY_ALIASES.get(plan.memory, plan.memory))
 
 
-def plan_problems(plan: VaePlan, training: bool = False, latent_cache: str = "off"):
-    """Every problem with `plan`; in training the VAE runs on the host only when the
-    latent cache is offline (sample decodes, the offline cache pass)."""
+def plan_problems(plan: VaePlan) -> list[str]:
+    """Every problem with `plan`."""
     p = []
     if plan.memory not in MEMORY:
         p.append(f"VAE memory={plan.memory!r} not in {MEMORY}")
@@ -71,12 +77,6 @@ def plan_problems(plan: VaePlan, training: bool = False, latent_cache: str = "of
         p.append("VAE batch >= 1 and ahead >= 1")
     if plan.compile not in COMPILE:
         p.append(f"VAE compile={plan.compile!r} not in {COMPILE}")
-    if training and plan.memory == "cpu" and latent_cache != "offline":
-        p.append(
-            "the VAE runs on the CPU only for the offline cache pass; with "
-            f"LATENT_CACHE={latent_cache!r} it encodes during training on the GPU: set "
-            "VAE_ENCODE memory to 'offload' / 'stream' / 'resident' (or 'auto')"
-        )
     return p
 
 
@@ -96,13 +96,13 @@ def choose_vae_memory(
 ) -> str:
     """The fastest placement that fits: resident (weights next to the DiT step reserve),
     else offload (weights and one pass's activations once the step released its
-    buffers), else stream."""
+    buffers), else ring."""
     act = vae_act_bytes(pixels, tile)
     if weights + reserve + act <= budget:
         return "resident"
     if weights + act <= budget - reserve // 2:
         return "offload"
-    return "stream"
+    return "ring"
 
 
 def choose_vae_plan(
@@ -111,7 +111,7 @@ def choose_vae_plan(
     """`memory='auto'` resolved: the fastest placement that fits untiled (unless `tile`
     is set), else tiled passes with the fastest placement that fits then."""
     untiled = choose_vae_memory(weights, budget, reserve, pixels, plan.tile)
-    if plan.tile or untiled != "stream":
+    if plan.tile or untiled != "ring":
         return replace(plan, memory=untiled)
     tiled = choose_vae_memory(weights, budget, reserve, pixels, True)
     return replace(plan, memory=tiled, tile=True)
@@ -129,6 +129,23 @@ class _Resident:
 
     def end(self) -> None:
         return None
+
+
+class _Host(_Resident):
+    """Everything on the host; encode and decode run there, each pass under
+    `host_gemm` of the VAE's dtype."""
+
+    name = "cpu"
+
+    def __init__(self, inner: nn.Module, device: torch.device):
+        super().__init__(inner, device)
+        self.gemm = host_gemm(next(inner.parameters()).dtype)
+
+    def begin(self) -> None:
+        self.gemm.__enter__()
+
+    def end(self) -> None:
+        self.gemm.__exit__(None, None, None)
 
 
 class _Offload:
@@ -157,15 +174,15 @@ class _Offload:
         self.copies.end()
 
 
-class _Stream:
+class _Ring:
     """Encoder / decoder blocks through layer rings; the rest offloaded per pass."""
 
-    name = "stream"
+    name = "ring"
 
     def __init__(self, inner: nn.Module, device: torch.device):
         parts = [getattr(inner, n) for n in ("encoder", "decoder") if hasattr(inner, n)]
         lists = [find_layer_list(m) for m in (parts or [inner])]
-        self.streamers = [LayerStreamer(lst, device, resident=2) for lst in lists]
+        self.streamers = [LayerStreamer(lst, device, slots=2) for lst in lists]
         self.rest = _Offload(
             inner, device, tensor_ids([b for lst in lists for b in lst])
         )
@@ -186,8 +203,8 @@ class _Stream:
 PLACEMENTS = {
     "resident": _Resident,
     "offload": _Offload,
-    "stream": _Stream,
-    "cpu": _Resident,
+    "ring": _Ring,
+    "cpu": _Host,
 }
 
 
@@ -230,7 +247,8 @@ class PlacedVae:
         self.before_pass()
         self.placement.begin()
         try:
-            out = fn()
+            with on_device(torch.device(self.device)):
+                out = fn()
         finally:
             self.placement.end()
         self.after_pass()
@@ -267,13 +285,14 @@ def place_vae(
 ) -> PlacedVae:
     """`vae` (a FluxVae, loaded on the host) placed by its plan; `memory='auto'` picks
     the fastest placement that fits the device's free memory next to `reserve` bytes
-    (`choose_vae_plan`: tiled passes when nothing fits untiled)."""
+    (`choose_vae_plan`: tiled passes when nothing fits untiled), 'cpu' on the host."""
     plan = vae_plan(spec)
     device = torch.device(device)
     if plan.memory == "auto":
         if streamed(device):
-            free, _ = accel(device).mem_get_info(with_index(device))
+            free = free_bytes(with_index(device))
             plan = choose_vae_plan(plan, vae_bytes(vae.vae), free, reserve, pixels)
         else:
-            plan = replace(plan, memory="resident")
+            on_host = device.type == "cpu"
+            plan = replace(plan, memory="cpu" if on_host else "resident")
     return PlacedVae(vae, plan, device)

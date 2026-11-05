@@ -6,10 +6,12 @@ trace windows for every layout (`parallel_problems`), and the per-layout limits 
 import sys
 
 from kohakumoss.adapters.build.config import config_from_knobs
+from kohakumoss.memory.estimate import base_precision
 from kohakumoss.offload.accel import default_type
 from kohakumoss.parallel.launch import default_backend
 from kohakumoss.parallel.pipeline.distributed import schedule_problems
 from kohakumoss.parallel.pipeline.split import SPLITS
+from kohakumoss.training.weights import stored_dit_precision
 from kohakumoss.types.plans import PrecisionConfig
 from kohakumoss_data import DataConfig, pipeline_problems
 
@@ -64,15 +66,6 @@ def _windows_problems(k: dict) -> list[str]:
     ]
 
 
-def _native_driver(k: dict) -> list[str]:
-    if k["DRIVER"] == "native":
-        return []
-    return [
-        f"PARALLEL={k['PARALLEL']!r} runs on DRIVER='native' (DRIVER='lightning' "
-        "supports PARALLEL 'none' | 'ddp')"
-    ]
-
-
 def _no_loop_sampling(k: dict) -> list[str]:
     if k["SAMPLE_EVERY"] <= 0 and k["VALIDATE_EVERY"] <= 0:
         return []
@@ -99,7 +92,7 @@ def ddp_problems(k: dict) -> list[str]:
 def fsdp_problems(k: dict) -> list[str]:
     """PARALLEL='fsdp': whole-matrix optimizers, fp32 parameters next to 16-bit ones in
     one unit, the gloo backend and rank-0 sampling cannot run on shards."""
-    p = _windows_problems(k) + _native_driver(k)
+    p = _windows_problems(k)
     if k["OPTIMIZER"] == "muon":
         p.append(
             "OPTIMIZER='muon' orthogonalises whole matrices; under PARALLEL='fsdp' it "
@@ -126,16 +119,16 @@ def fsdp_problems(k: dict) -> list[str]:
 
 
 def pipeline_layout_problems(k: dict) -> list[str]:
-    """PARALLEL='pipeline': the schedule over the stages, the pipeline's data plan, the
-    native driver, no in-loop sampling."""
-    p = _windows_problems(k) + _native_driver(k) + _no_loop_sampling(k)
+    """PARALLEL='pipeline': the schedule over the stages, the pipeline's data plan, no
+    in-loop sampling."""
+    p = _windows_problems(k) + _no_loop_sampling(k)
     p += schedule_problems(k["PIPELINE_SCHEDULE"], len(k["DEVICES"]), k["MICROBATCHES"])
     return p + pipeline_problems(DataConfig.from_knobs(k))
 
 
 def threaded_problems(k: dict) -> list[str]:
-    """PARALLEL='threaded': its schedules, the native driver, no in-loop sampling."""
-    p = _windows_problems(k) + _native_driver(k) + _no_loop_sampling(k)
+    """PARALLEL='threaded': its schedules, no in-loop sampling."""
+    p = _windows_problems(k) + _no_loop_sampling(k)
     if k["PIPELINE_SCHEDULE"] not in THREADED_SCHEDULES:
         p.append(
             f"PARALLEL='threaded' runs PIPELINE_SCHEDULE in {THREADED_SCHEDULES}, "
@@ -144,25 +137,44 @@ def threaded_problems(k: dict) -> list[str]:
     return p
 
 
+ALLOWED = {
+    "fsdp": "checkpointing (CHECKPOINT block / selective / partial:<f>) is supported "
+    "there, memory offload is not",
+    "pipeline": "checkpointing (every CHECKPOINT) is supported there, memory offload "
+    "is not",
+    "threaded": "checkpointing (every CHECKPOINT) is supported there, memory offload "
+    "is not",
+}
+
+
 def _in_backward_steps(k: dict, plan) -> list[str]:
     kind, p = k["PARALLEL"], []
+    allowed = ALLOWED.get(kind, "")
     if plan.fused_step:
-        p.append(f"PARALLEL={kind!r} needs fused_step=False (none / ddp only)")
+        p.append(
+            f"PARALLEL={kind!r} needs fused_step=False (none / ddp only): {allowed}"
+        )
     if plan.grad_offload:
-        p.append(f"PARALLEL={kind!r} needs grad_offload=False (none / ddp only)")
+        p.append(
+            f"PARALLEL={kind!r} needs grad_offload=False (none / ddp only): {allowed}"
+        )
     return p
 
 
 def _resident(k: dict, plan) -> list[str]:
     kind, p = k["PARALLEL"], []
+    allowed = ALLOWED.get(kind, "")
+    precision = base_precision(plan, stored_dit_precision(k))
     for field, value, ok in (
         ("stream", plan.stream, "off"),
         ("optim_state", plan.optim_state, "gpu"),
-        ("base_precision", plan.base_precision, "compute"),
+        ("base_precision", precision, "compute"),
         ("act_offload", plan.act_offload, False),
     ):
         if value != ok:
-            p.append(f"PARALLEL={kind!r} needs {field}={ok!r}, not {value!r}")
+            p.append(
+                f"PARALLEL={kind!r} needs {field}={ok!r}, not {value!r}: {allowed}"
+            )
     return p
 
 
@@ -199,7 +211,7 @@ def threaded_plan_problems(k: dict, plan) -> list[str]:
     """PARALLEL='threaded' with a memory plan: resident, per-step optimizer, and no
     per-micro-batch adapter state under the async schedule's recompute."""
     p = _in_backward_steps(k, plan) + _resident(k, plan)
-    stepped = k["ALGO"] != "full" and config_from_knobs(k).step_state
+    stepped = k["ALGO"] != "full" and config_from_knobs(k).has_step_state
     async_recompute = k["PIPELINE_SCHEDULE"] == "async" and plan.checkpoint != "none"
     if async_recompute and stepped:
         p.append(

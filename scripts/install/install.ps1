@@ -15,6 +15,7 @@ function Invoke-Step([string]$What, [scriptblock]$Step) {
 }
 
 if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    # "CUDA Version: X.Y", or "CUDA UMD Version: X.Y" on newer drivers
     $m = [regex]::Match((nvidia-smi | Out-String), "CUDA (?:UMD )?Version:\s*(\d+)\.(\d+)")
     if (-not $m.Success) { throw "could not read the CUDA version from nvidia-smi; $Manual" }
     $ver = [int]$m.Groups[1].Value * 100 + [int]$m.Groups[2].Value

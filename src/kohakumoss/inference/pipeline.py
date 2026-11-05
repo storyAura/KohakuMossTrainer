@@ -19,7 +19,7 @@ from kohakumoss.inference import peaks
 from kohakumoss.inference import placement_report as report
 from kohakumoss.inference.components import Components
 from kohakumoss.inference.loading import (
-    component_root,
+    component_paths,
     load_dit,
     load_text_encoder,
     load_vae,
@@ -94,6 +94,12 @@ def _step_report(pbar, sigmas: list[float], user, clock, i: int, x: Tensor) -> N
         user(i, x)
 
 
+def batch_slices(n: int, batch: int) -> list[slice]:
+    """`n` prompts in consecutive packed batches of `batch` (0: one batch of all)."""
+    step = batch if batch > 0 else max(n, 1)
+    return [slice(s, s + step) for s in range(0, n, step)]
+
+
 def _decode_bar(progress: bool, n: int):
     """Latent-iteration wrapper of the VAE decode: a bar over more than one image."""
     if not progress or n < 2:
@@ -146,16 +152,26 @@ class MossPipeline:
         cusolver = owned and self.device.type == "cuda"
         self._linalg = cusolver_linalg if cusolver else nullcontext
         self.memory_plan = MemoryPlan()
-        self.stream = None
+        self.weight_stream = None
 
     @classmethod
     def from_components(
-        cls, backbone, text_encoder=None, vae=None, device=None
+        cls,
+        backbone,
+        text_encoder=None,
+        vae=None,
+        device=None,
+        memory_plan: MemoryPlan | None = None,
+        weight_stream=None,
     ) -> "MossPipeline":
-        """Share already-built modules (the training model, its placed VAE): no
-        reload, no_grad only, TUNE left to the trainer (it owns the kernels)."""
+        """Share already-built modules (the training model under its `memory_plan` and
+        `weight_stream`, its placed VAE): no reload, no_grad only, TUNE left to the
+        trainer (it owns the kernels)."""
         device = device or next(backbone.parameters()).device
-        return cls(backbone, text_encoder, vae, device, owned=False)
+        pipe = cls(backbone, text_encoder, vae, device, owned=False)
+        pipe.memory_plan = memory_plan or MemoryPlan()
+        pipe.weight_stream = weight_stream
+        return pipe
 
     @classmethod
     def from_pretrained(
@@ -181,10 +197,15 @@ class MossPipeline:
         memory_overrides: dict | None = None,
         reserve_gib: float | None = None,
         forward_tokens: int | None = None,
+        text_encoder_file: str = "",
+        vae_file: str = "",
     ) -> "MossPipeline":
-        """`path`: weights root (base/ sft/ subdirs, `variant` picks one) or one pipeline
+        """`path`: a ComfyUI models folder (one file per component: `transformer`,
+        `text_encoder_file`, `vae_file` name them, "" the defaults, `variant` picks the
+        DiT), a weights root (base/ sft/ subdirs, `variant` picks one) or one pipeline
         dir. `transformer` overrides the DiT weights (single file, HF dir, our
-        checkpoint or an fp16-fix file). `fp16_fix`: none | online | fp32_residual (+
+        checkpoint or an fp16-fix file), `text_encoder_file` / `vae_file` the text
+        encoder and VAE. `fp16_fix`: none | online | fp32_residual (+
         kwargs); an fp16-fix file carries its fold. `text_plan` (TextEncoderPlan or its
         fields, `free_after_use` included) places the text encoder, `vae_plan` (VaePlan
         fields) the VAE; an unset `memory` of either is 'auto': the fastest placement
@@ -200,10 +221,8 @@ class MossPipeline:
         is also tuned on its first use and stored; no prewarm)."""
         apply_tune(tune)
         path = Path(path)
-        dit = (
-            Path(transformer)
-            if transformer
-            else component_root(path, variant, "transformer")
+        dit, te_path, vae_path = component_paths(
+            path, variant, transformer or "", text_encoder_file, vae_file
         )
         sources = {"transformer": str(dit)}
         tokens = forward_tokens or report.REFERENCE_TOKENS
@@ -226,11 +245,11 @@ class MossPipeline:
             reserve = int(reserve_gib * GIB)
         te = decoder = None
         if text_encoder:
-            te_root = component_root(path, variant, "text_encoder")
+            te_root = te_path()
             sources["text_encoder"] = str(te_root)
             te = load_text_encoder(te_root, device, text_device, text_plan, reserve)
         if vae:
-            vae_root = component_root(path, variant, "vae")
+            vae_root = vae_path()
             sources["vae"] = str(vae_root)
             decoder = load_vae(vae_root, vae_dtype, device, vae_plan, reserve)
         pipe = cls(
@@ -244,7 +263,7 @@ class MossPipeline:
             sources=sources,
         )
         pipe.memory_plan = loaded.plan
-        pipe.stream = loaded.stream
+        pipe.weight_stream = loaded.weight_stream
         pipe.log_placement()
         return pipe
 
@@ -320,8 +339,12 @@ class MossPipeline:
         step_callback: Callable[[int, Tensor], None] | None = None,
         progress: bool = True,
     ) -> GenerateResult:
-        """One image per prompt; sample i depends only on its prompt, size and seed.
-        `progress` shows tqdm bars (sampler steps per batch, decode) at INFO level."""
+        """One image per prompt, `batch` prompts (0: all) per packed varlen forward of
+        their own sizes. Sample i's noise and conditioning depend only on its
+        prompt, size and seed (no other sample's content reaches it, its slot does
+        not matter); bitwise it also depends on the batch's shapes, which set the
+        kernels' problem shapes. `progress` shows tqdm bars (sampler steps per batch,
+        decode) at INFO level."""
         start = time.perf_counter()
         te = self.place.text_encoder
         if te is not None and hasattr(te, "progress"):
@@ -335,7 +358,7 @@ class MossPipeline:
         n = len(pos)
         seeds = list(seeds) if seeds is not None else list(range(n))
         size_list = [sizes] * n if isinstance(sizes[0], int) else list(sizes)
-        chunks = [slice(s, s + batch) for s in range(0, n, batch)]
+        chunks = batch_slices(n, batch)
         negs = [None] * len(chunks) if neg is None else [neg[c] for c in chunks]
         batch_max = self._largest_batch(pos, neg, size_list, chunks, cfg_mode)
         est = self._log_estimate(batch_max, max(h * w for h, w in size_list))
@@ -411,9 +434,17 @@ class MossPipeline:
             f"estimated peak {hl(peak_gib)} (the largest phase)",
             ("phase", "GiB", "on the device"),
             [
-                ("text encode", est["encode"], "DiT weights + text-encoder pass"),
+                (
+                    "text encode",
+                    est["encode"],
+                    "DiT weights + text-encoder pass + resident VAE",
+                ),
                 ("sampling", est["sampling"], f"DiT forward of {batch_max} tokens"),
-                ("decode", est["decode"], "DiT weights + VAE pass"),
+                (
+                    "decode",
+                    est["decode"],
+                    "DiT weights + resident text encoder + VAE pass",
+                ),
             ],
         )
         return est
@@ -437,7 +468,7 @@ class MossPipeline:
         """One packed batch through the sampler under the sampling autocast, timed per
         step; returns (sample result, step stats)."""
         sigmas = moss_sigmas(steps, shift).tolist()
-        clock = StepClock(self.device, len(sigmas) - 1, self.stream)
+        clock = StepClock(self.device, len(sigmas) - 1, self.weight_stream)
         clock.start()
         autocast = sampling_autocast(self.backbone, self.device)
         with (

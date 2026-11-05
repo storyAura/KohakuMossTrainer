@@ -1,5 +1,5 @@
 """Gradient offload: per-parameter gradients summed in fp32 host memory across the
-GRAD_ACC micro-batches, finished at `flush()` or inside the last backward
+GRAD_ACC micro-batches, finished at `drain()` or inside the last backward
 (`start(last, final)`). A step's first gradient of a parameter is copied into its sum
 and later ones added, so a sum is never zeroed; `filled` marks the sums holding this
 step's gradients. See docs/internals/offload.md."""
@@ -12,7 +12,9 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.accel import DONE, module, streamed
+from kohakumoss.offload.host.arena import host_tensors
 from kohakumoss.offload.optim.host_acc import HostAccumulator
+from kohakumoss_common.weak import weak_call
 
 
 @dataclass
@@ -35,7 +37,7 @@ def _event_after(device: torch.device):
 RING_SLOTS = 3
 
 
-def ring_bytes(largest: int) -> int:
+def grad_ring_bytes(largest: int) -> int:
     """Device bytes of the staging ring of a device's largest offloaded parameter."""
     return RING_SLOTS * 4 * largest
 
@@ -64,7 +66,8 @@ class _Ring:
 
 
 class GradOffload:
-    """Post-accumulate-grad hooks moving gradients to host fp32 accumulators."""
+    """Post-accumulate-grad hooks moving gradients to host fp32 accumulators (one
+    exact-size HostArena, `arena`, for the device parameters' sums)."""
 
     def __init__(self, params: Iterable[nn.Parameter], pinned: bool = True):
         self.params = [p for p in params if p.requires_grad]
@@ -81,25 +84,33 @@ class GradOffload:
         largest: dict[torch.device, int] = {}
         for p in self.params:
             largest[p.device] = max(largest.get(p.device, 0), p.numel())
+        side_params = [p for p in self.params if streamed(p.device)]
+        specs = [(p.shape, torch.float32) for p in side_params]
+        where = side_params[0].device if side_params else torch.device("cpu")
+        self.arena, side_sums = host_tensors(specs, pinned, where)
+        sums = {id(p): s for p, s in zip(side_params, side_sums)}
         for p in self.params:
-            cuda = streamed(p.device)
-            host = torch.zeros(p.shape, dtype=torch.float32, pin_memory=pinned and cuda)
+            side = streamed(p.device)
+            host = sums[id(p)] if side else torch.zeros(p.shape, dtype=torch.float32)
             lane = _Lane(host)
-            if cuda:
+            if side:
                 stream = self._stream(p.device)
-                offload = partial(self._offload_device, lane, stream, id(p))
+                offload = partial(
+                    GradOffload._offload_device, lane=lane, stream=stream, key=id(p)
+                )
                 ring = self.rings.get(p.device)
                 if ring is None:
                     ring = _Ring(p.device, largest[p.device])
                     self.rings[p.device] = ring
-                finish = partial(self._finish_device, lane, ring)
+                finish = partial(GradOffload._finish_device, lane=lane, ring=ring)
             else:
-                offload = partial(self._offload_host, lane)
-                finish = partial(self._finish, lane)
+                offload = partial(GradOffload._offload_host, lane=lane)
+                finish = partial(GradOffload._finish, lane=lane)
             self.host[p] = host
             self.lanes[id(p)] = lane
             self.finishes[id(p)] = finish
-            hook = partial(self._hook, {"offload": offload, "finish": finish})
+            bodies = {"offload": offload, "finish": finish}
+            hook = weak_call(GradOffload._hook, self, bodies)
             self.handles.append(p.register_post_accumulate_grad_hook(hook))
 
     def _stream(self, device: torch.device):
@@ -115,7 +126,7 @@ class GradOffload:
         self._mode = "finish" if last and final is not None else "offload"
 
     def _hook(self, bodies: dict, p: Tensor) -> None:
-        bodies[self._mode](p)
+        bodies[self._mode](self, p=p)
 
     @torch.no_grad()
     def _offload_host(self, lane: _Lane, p: Tensor) -> None:
@@ -171,7 +182,7 @@ class GradOffload:
         p.grad = None
 
     @torch.no_grad()
-    def settle(self) -> None:
+    def finish_unhooked(self) -> None:
         """After the last backward started with a `final`: finish every parameter whose
         hook did not fire in it but whose sum holds earlier micro-batches' gradients
         (their sum becomes its gradient)."""
@@ -180,16 +191,16 @@ class GradOffload:
         for p in self.params:
             if self.lanes[id(p)].filled:
                 p.grad = torch.zeros_like(p)
-                self.finishes[id(p)](p)
+                self.finishes[id(p)](self, p=p)
 
     def finish(self) -> None:
-        """`settle`, then the compute stream waits for every in-backward update
+        """`finish_unhooked`, then the compute stream waits for every in-backward update
         (before the next forward reads the parameters)."""
-        self.settle()
+        self.finish_unhooked()
         for device, ring in self.rings.items():
             ring.dm.current_stream(device).wait_stream(ring.opt)
 
-    def flush(self) -> None:
+    def drain(self) -> None:
         """Land every in-flight copy (call after the last micro-batch's backward)."""
         self.acc.drain()
 

@@ -1,4 +1,4 @@
-"""Multi-GPU sanity + link measurement: spawn one process per device (no torchrun), run
+"""Multi-GPU sanity + link measurement: spawn one process per device itself, run
 the gradient-reducer check and the all_reduce / all_gather / reduce_scatter / p2p hop
 sweeps.
 
@@ -8,13 +8,12 @@ Writes <OUT>/<backend>_<n>.json.
 
 import json
 import os
-import tempfile
 
 import torch
 
 from kohakumoss.logging.log import get_logger, setup
+from kohakumoss.parallel.launch import default_backend
 from kohakumoss.parallel.telemetry import selftest
-from kohakumoss.parallel.launch import default_backend, spawn
 from kohakumoss.types.plans import ParallelPlan
 from kohakumoss_common.knobs import check_script
 
@@ -28,9 +27,7 @@ OUT = "runs/bench/dist"  # report directory
 
 
 def run(worker, plan, device_type, *args):
-    path = os.path.join(tempfile.mkdtemp(), "res")
-    spawn(worker, plan, path, *args, device_type=device_type)
-    return selftest.read_results(path, len(plan.devices))
+    return selftest.spawn_results(worker, plan, *args, device_type=device_type)
 
 
 def main():

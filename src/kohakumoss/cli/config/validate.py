@@ -15,6 +15,7 @@ from kohakuengine import introspect_schema, load_config_file
 
 import kohakumoss
 from kohakumoss.cli.config.presets import LAYER_GROUPS
+from kohakumoss.heal import config as heal_config
 from kohakumoss.inference import knobs as sample_knobs
 from kohakumoss.training import knobs as train_knobs
 from kohakumoss_data import DataConfig, data_problems
@@ -22,6 +23,7 @@ from kohakumoss_data import DataConfig, data_problems
 SCRIPT_RE = re.compile(r"scripts/[\w/]+\.py")
 TRAIN = "scripts/train/moss.py"
 SAMPLE = "scripts/sample/sample.py"
+HEAL = "scripts/heal/heal.py"
 BASES = {
     TRAIN: "configs/moss/_base/base_lora.py",
     SAMPLE: "configs/sample/_base/base_sample.py",
@@ -115,6 +117,17 @@ def problems(script: str, k: dict) -> list[str]:
         return sample_knobs.validate(k)
     if script.startswith("scripts/data/"):
         return data_problems(DataConfig.from_knobs(k))
+    if script == HEAL:
+        return heal_config.problems(heal_config.from_knobs(k), paths=False)
+    return []
+
+
+def warnings_of(script: str, k: dict) -> list[str]:
+    """The knob combinations the script runs but logs a warning for."""
+    if script == TRAIN:
+        return train_knobs.knob_warnings(k)
+    if script == SAMPLE:
+        return sample_knobs.knob_warnings(k)
     return []
 
 
@@ -146,13 +159,3 @@ def config_problems(config: Path, root: Path | None = None) -> list[str]:
 def blocking(found: list[str]) -> list[str]:
     """The problems a missing path does not explain."""
     return [p for p in found if MISSING not in p]
-
-
-def shipped_configs(root: Path) -> list[Path]:
-    """Every config file under configs/ except the written ones (configs/user/)."""
-    user = root / USER_DIR
-    return sorted(
-        p
-        for p in (root / "configs").rglob("*.py")
-        if user not in p.parents and "__pycache__" not in p.parts
-    )

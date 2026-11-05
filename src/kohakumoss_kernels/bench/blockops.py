@@ -10,14 +10,20 @@ from pathlib import Path
 
 import torch
 
-from kohakumoss_kernels import registry
+from kohakumoss_kernels import compile_setup, registry
 from kohakumoss_kernels.backends.compile.ops import COMPILED, compiled_op
-from kohakumoss_kernels.backends.compile.prewarm import segment_ids
 from kohakumoss_kernels.error_stats import stats, worse
 from kohakumoss_kernels.hardware.device import measure_rates
 from kohakumoss_kernels.tuning.timing import best_ms, graph_ms, l2_flush
 
 __all__ = ["contenders", "dtypes", "measure", "parse", "report", "segment_ids"]
+
+
+def segment_ids(lengths: list[int], device) -> torch.Tensor:
+    """Per-token sample index (int32 [sum(lengths)]) of samples packed in order."""
+    return torch.cat(
+        [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(lengths)]
+    ).to(device)
 
 
 def parse() -> argparse.Namespace:
@@ -148,6 +154,7 @@ def contenders(
     }
     if use_compile:
         torch._dynamo.reset()
+        compile_setup.apply()
         fns["compile"] = torch.compile(eager_fn, dynamic=False)
         if op in COMPILED:
             fns["compile_dyn"] = compiled_op(op)

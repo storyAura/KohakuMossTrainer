@@ -10,34 +10,38 @@ from kohakumoss.encoders.knob_names import ENCODER_FIELDS, RENAMED_SAMPLE, SAMPL
 from kohakumoss.encoders.text.plan import plan_problems as text_problems
 from kohakumoss.encoders.text.plan import text_plan
 from kohakumoss.encoders.vae import vae_dtype_problems
+from kohakumoss.logging.log import get_logger
 from kohakumoss.memory.knob_map import (
     MANUAL,
     MEMORY_KNOBS,
     PLACEMENT_KNOBS,
     knob_fields,
     mixing_problems,
+    primary_names,
 )
 from kohakumoss.memory.profiles import PROFILES
 from kohakumoss.model.io.load import read_fp16_fix
-from kohakumoss.model.numerics import fix_problems
+from kohakumoss.model.numerics import fix_problems, fix_warnings
 from kohakumoss.offload.encoders.vae import plan_problems as vae_problems
 from kohakumoss.offload.encoders.vae import vae_plan
 from kohakumoss.types.arch import PRESETS
+from kohakumoss.weights import DIT, TEXT, VAE, component_path, is_comfy_folder
 from kohakumoss_common.knobs import choice_problems, collect, exit_on, unknown_problems
 from kohakumoss_data.resolution.geometry import LATENT_FACTOR
 from kohakumoss_kernels.dtypes import BY_NAME
 from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.tuning.tuner import MODES as TUNE_MODES
 
+log = get_logger(__name__)
 INFERENCE_KNOBS = {name: MEMORY_KNOBS[name] for name in PLACEMENT_KNOBS}
 KNOWN = frozenset(
-    """WEIGHTS VARIANT TRANSFORMER PROMPT PROMPTS PROMPTS_FILE NEGATIVE SIZES SEEDS
+    """WEIGHTS VARIANT TRANSFORMER TEXT_ENCODER VAE PROMPT PROMPTS PROMPTS_FILE NEGATIVE SIZES SEEDS
     SEED_BASE STEPS CFG SHIFT SKIP_LAYERS CFG_MODE BATCH PRECISION FP16_FIX
     FP16_FIX_KWARGS ADAPTERS ADAPTER_MODE DEVICE TEXT_DEVICE TEXT_ENCODE VAE_ENCODE
     VAE_DTYPE TUNE OUT MEMORY_PROFILE MEMORY_OVERRIDES BASE_PRECISION FP8_RECIPE STREAM
-    STREAM_RESIDENT PINNED PROGRESS""".split()
+    STREAM_RESIDENT PINNED PROGRESS INT8_COMPUTE""".split()
 )
-BASE_PRECISIONS = ("compute", "int8", "fp8", "fp8_compute", "mxfp8")
+BASE_PRECISIONS = ("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")
 FP8_RECIPES = ("tensor", "row", "block")
 TORCH_DTYPES = BY_NAME
 DTYPE_NAMES = (*TORCH_DTYPES, "auto")
@@ -149,6 +153,26 @@ def _missing(name: str, path: str) -> list[str]:
     return [] if os.path.exists(path) else [f"{name}={path!r} does not exist"]
 
 
+COMPONENT_KNOBS = {DIT: "TRANSFORMER", TEXT: "TEXT_ENCODER", VAE: "VAE"}
+
+
+def component_problems(k: dict) -> list[str]:
+    """TRANSFORMER / TEXT_ENCODER / VAE: a set path exists; in a ComfyUI WEIGHTS
+    folder a file name (or the default) names a file there."""
+    p = []
+    comfy = bool(k["WEIGHTS"]) and is_comfy_folder(k["WEIGHTS"])
+    for which, name in COMPONENT_KNOBS.items():
+        choice = k.get(name) or ""
+        if comfy:
+            try:
+                component_path(k["WEIGHTS"], which, choice, k["VARIANT"])
+            except FileNotFoundError as err:
+                p.append(f"{name}: {err}")
+        elif choice:
+            p += _missing(name, choice)
+    return p
+
+
 def size_problems(k: dict) -> list[str]:
     """SIZES entries that are not 'HxW' / (H, W) multiples of the latent factor."""
     p = []
@@ -205,17 +229,24 @@ def encoder_problems(k: dict) -> list[str]:
 
 def memory_of(k: dict) -> tuple[str | None, dict]:
     """(DiT memory profile or None, MemoryPlan overrides) of MEMORY_PROFILE /
-    BASE_PRECISION / FP8_RECIPE / MEMORY_OVERRIDES: a quantized BASE_PRECISION places
-    the DiT under the `speed` profile unless MEMORY_PROFILE names one."""
+    BASE_PRECISION / FP8_RECIPE / INT8_COMPUTE / MEMORY_OVERRIDES: a quantized
+    BASE_PRECISION places the DiT under the `speed` profile unless MEMORY_PROFILE
+    names one; `compute` is
+    passed on (a pre-quantized DiT file is dequantized at load); `auto` keeps what the
+    file stores."""
     overrides = dict(k.get("MEMORY_OVERRIDES") or {})
-    precision = k.get("BASE_PRECISION", "compute")
+    precision = k.get("BASE_PRECISION", "auto")
     memory = k.get("MEMORY_PROFILE") or None
     if memory == MANUAL:
         overrides.update(knob_fields(k, INFERENCE_KNOBS))
-    if precision != "compute":
+    if precision == "compute":
+        overrides.setdefault("base_precision", precision)
+    elif precision != "auto":
         overrides.setdefault("base_precision", precision)
         overrides.setdefault("fp8_recipe", k.get("FP8_RECIPE", "row"))
         memory = memory or "speed"
+    if k.get("INT8_COMPUTE"):
+        overrides.setdefault("int8_compute", True)
     return memory, overrides
 
 
@@ -230,27 +261,18 @@ def validate(k: dict) -> list[str]:
         p.append("WEIGHTS is empty (a weights root or pipeline dir)")
     else:
         p += _missing("WEIGHTS", k["WEIGHTS"])
-    if k["TRANSFORMER"]:
-        p += _missing("TRANSFORMER", k["TRANSFORMER"])
+    p += component_problems(k)
     if not k["OUT"]:
         p.append("OUT is empty (output directory)")
     if k["STEPS"] <= 0:
         p.append(f"STEPS must be > 0, got {k['STEPS']}")
-    if k["BATCH"] < 1:
-        p.append(f"BATCH must be >= 1, got {k['BATCH']}")
+    if k["BATCH"] < 0:
+        p.append(
+            f"BATCH must be >= 0 (0 = every prompt in one batch), got {k['BATCH']}"
+        )
     if k["CFG"] < 0:
         p.append(f"CFG must be >= 0, got {k['CFG']}")
-    fp16 = k["PRECISION"] == "fp16" or (
-        k["PRECISION"] == "auto" and compute_dtype("auto", k["DEVICE"]) == torch.float16
-    )
-    p += fix_problems(
-        k["FP16_FIX"],
-        k["FP16_FIX_KWARGS"],
-        fp16,
-        carries_fix(k["TRANSFORMER"]),
-        "PRECISION='fp16'",
-        "TRANSFORMER",
-    )
+    p += fix_problems(k["FP16_FIX"], k["FP16_FIX_KWARGS"])
     try:
         p += skip_problems(skip_layers(k["SKIP_LAYERS"]))
     except (TypeError, ValueError):
@@ -263,8 +285,25 @@ def validate(k: dict) -> list[str]:
     return list(dict.fromkeys(p))
 
 
+def knob_warnings(k: dict) -> list[str]:
+    """The knob combinations that run but are logged: fp16 compute on an unfixed DiT."""
+    fp16 = k["PRECISION"] == "fp16" or (
+        k["PRECISION"] == "auto" and compute_dtype("auto", k["DEVICE"]) == torch.float16
+    )
+    return fix_warnings(
+        k["FP16_FIX"],
+        fp16,
+        carries_fix(k["TRANSFORMER"]),
+        "PRECISION='fp16'",
+        "TRANSFORMER",
+    )
+
+
 def check(g: dict) -> dict:
-    """Knobs from globals; raises one SystemExit listing every problem."""
-    k = collect(g)
+    """Knobs from globals (MEMORY_PROFILE in its primary spelling); raises one
+    SystemExit listing every problem and logs every warning."""
+    k = primary_names(collect(g))
     exit_on(validate(k))
+    for message in knob_warnings(k):
+        log.warning(message)
     return k

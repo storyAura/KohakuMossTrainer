@@ -49,7 +49,7 @@ def test_split_bytes_and_sizes():
     assert report.split_bytes(m) == (on, host)
     assert report.split_bytes(m, "cpu") == (on + host, 0)
     assert report.split_bytes(None) == (0, 0)
-    assert report.gib(3 * GIB / 2) == "1.50 GiB"
+    assert report.gib_text(3 * GIB / 2) == "1.50 GiB"
     must_fail(lambda: _equal(report.split_bytes(m), (on + host, 0)), "all on device")
     must_fail(lambda: _equal(report.split_bytes(m), (on, 4 * 4 * 2)), "buffers dropped")
 
@@ -62,9 +62,10 @@ class Plan:
 
 
 class Placement:
-    def __init__(self, name, device, resident=2, res=GIB // 4, run=GIB):
-        self.name, self.device, self.resident = name, torch.device(device), resident
-        self.pinned = name in ("stream", "offload")
+    def __init__(self, name, device, slots=2, res=GIB // 4, run=GIB):
+        self.name, self.device, self.slots = name, torch.device(device), slots
+        self.pinned = name in ("ring", "offload")
+        self.host = "copy"
         self._res, self._run = res, run
 
     def resident_bytes(self):
@@ -90,9 +91,9 @@ def _host_half_gib() -> nn.Module:
     "name, words",
     [
         (
-            "stream",
+            "ring",
             [
-                "-> stream (weights in host RAM, pinned, 0.50 GiB;",
+                "-> ring (weights in host RAM, pinned, 0.50 GiB;",
                 "ring of 2 layers on cuda:0",
             ],
         ),
@@ -104,7 +105,13 @@ def _host_half_gib() -> nn.Module:
             ],
         ),
         ("resident", ["-> resident on cuda:0 (0.25 GiB; precision fp8, bf16)"]),
-        ("cpu", ["-> cpu (weights in host RAM, 0.50 GiB;", "runs on the host"]),
+        (
+            "cpu",
+            [
+                "-> cpu (weights in host RAM, 0.50 GiB;",
+                f"runs on the host, {torch.get_num_threads()} threads",
+            ],
+        ),
     ],
 )
 def test_text_encoder_lines(name, words):
@@ -114,7 +121,7 @@ def test_text_encoder_lines(name, words):
     _names(line, "text encoder: w/text_encoder -> ", "precision fp8", *words)
     assert fields["gpu_pass_gib"] == 1.0 and fields["gpu_gib"] == 0.25
     assert fields["host_gib"] == 0.5
-    if name == "stream":
+    if name == "ring":
         _names(line, "~0.75 GiB, 0.25 GiB resident")
     old = "loading text encoder w/text_encoder on cuda:0"
     must_fail(lambda: _names(old, *words), "the old load line")
@@ -131,10 +138,14 @@ def test_vae_lines():
     line, fields = report.vae_line(vae, "w/vae", "offload", "cuda:0")
     _names(line, "VAE: w/vae -> offload (host RAM, moved to cuda:0 per pass, 0.25 GiB)")
     assert fields == {"gib": 0.25}
-    line, _ = report.vae_line(vae, "w/vae", "stream", "cuda:0")
-    _names(line, "VAE: w/vae -> stream (host RAM, 0.25 GiB;", "2-layer ring on cuda:0")
+    line, _ = report.vae_line(vae, "w/vae", "ring", "cuda:0")
+    _names(line, "VAE: w/vae -> ring (host RAM, 0.25 GiB;", "2-layer ring on cuda:0")
     line, _ = report.vae_line(vae, "w/vae", "cpu", "cpu")
-    _names(line, "VAE: w/vae -> cpu (host RAM, 0.25 GiB; runs on the host)")
+    threads = torch.get_num_threads()
+    _names(
+        line,
+        f"VAE: w/vae -> cpu (host RAM, 0.25 GiB; runs on the host, {threads} threads)",
+    )
     line, _ = report.vae_line(vae, "w/vae", "gpu", "cuda:0")
     _names(line, "VAE: w/vae -> resident on cuda:0 (0.25 GiB)")
     must_fail(lambda: _names(line, "host RAM"), "a resident VAE read as offloaded")

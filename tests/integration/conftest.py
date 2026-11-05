@@ -20,6 +20,7 @@ from kohakumoss.encoders.vae import FluxVae
 from kohakumoss.offload.encoders.vae import place_vae
 from kohakumoss.training.entry import run
 from kohakumoss.types.seqinfo import build_seqinfo
+from kohakumoss_kernels.hardware.arch import arch_of
 from tests._util.dataset import IMAGE_SUFFIXES, kohya_slice, kohya_source
 from tests.training.knobs.test_knobs import script_defaults
 
@@ -27,6 +28,21 @@ SLICE = 16
 FIX_FILE = "fp16fix/moss_image_base_fp16fix_c0.0625.safetensors"
 GRIDS = ((16, 16), (12, 20))  # latent grids of the encoded batch (256x256, 192x320 px)
 SIGMAS = (0.35, 0.75)
+
+
+def needs_precision(precision: str, device: str = "cuda") -> None:
+    """Skip a case whose subject is `precision` on a card without it (bf16: sm80+)."""
+    arch = arch_of(device)
+    if precision == "bf16" and not arch.has_bf16:
+        pytest.skip(f"bf16 needs a card with bf16; {arch.name} has none")
+
+
+def card_precision(device: str = "cuda") -> dict:
+    """PRECISION "auto" as the trainer resolves it on `device` (bf16 where the card has
+    it, else fp16), with the online fold an fp16 run on the base weights needs."""
+    if arch_of(device).has_bf16:
+        return {"PRECISION": "bf16"}
+    return {"PRECISION": "fp16", "FP16_FIX": "online", "FP16_FIX_KWARGS": {"c": 1 / 16}}
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +59,16 @@ def weights_root() -> Path:
     root = os.environ.get("KOHAKUMOSS_WEIGHTS")
     if not root:
         pytest.skip("KOHAKUMOSS_WEIGHTS unset")
+    return Path(root)
+
+
+@pytest.fixture(scope="session")
+def comfy_root() -> Path:
+    """A ComfyUI models folder with the Comfy-Org MOSS-Image files (KOHAKUMOSS_COMFY:
+    diffusion_models/, text_encoders/, vae/)."""
+    root = os.environ.get("KOHAKUMOSS_COMFY")
+    if not root:
+        pytest.skip("KOHAKUMOSS_COMFY unset")
     return Path(root)
 
 
@@ -142,8 +168,10 @@ def real_batch(weights_root, dataset_slice) -> RealBatch:
 
 def real_knobs(weights_root: Path, dataset: Path, out: Path, **overrides) -> dict:
     """The train script's defaults for a short real run on `dataset` (kohya source,
-    artist from the folder, online caches, the text encoder streamed)."""
+    artist from the folder, online caches, the text encoder streamed) in the card's
+    16-bit precision (`card_precision`)."""
     k = script_defaults()
+    k.update(card_precision())
     k.update(
         WEIGHTS=str(weights_root / "base"),
         VARIANT="base",
@@ -160,6 +188,7 @@ def real_knobs(weights_root: Path, dataset: Path, out: Path, **overrides) -> dic
         KEEP_LAST=0,
         SAMPLE_EVERY=0,
         LOG_EVERY=1,
+        METRICS_LEVEL="debug",
         PROGRESS=False,
         TUNE="table",
         NUM_WORKERS=2,

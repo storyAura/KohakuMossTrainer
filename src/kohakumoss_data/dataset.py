@@ -15,7 +15,7 @@ from kohakumoss_common.registry import build
 from kohakumoss_data.cache.settings import offline_miss, record
 from kohakumoss_data.cache.store import LengthTable
 from kohakumoss_data.cache.tensor_cache import LatentCache, TextCache
-from kohakumoss_data.caption.template import build_template
+from kohakumoss_data.caption.template import bind_template, build_template
 from kohakumoss_data.catalog.vault import is_catalog_vault
 from kohakumoss_data.config import (
     TOKEN_BUDGETS,
@@ -33,7 +33,7 @@ from kohakumoss_data.scan.paths import scan_path
 from kohakumoss_data.scan.runner import scan_catalog
 from kohakumoss_data.scan.walk import rows_of
 from kohakumoss_data.seeds import rng_of
-from kohakumoss_data.types import HostBatch, PlanItem
+from kohakumoss_data.types import HostBatch, PlanItem, RowGeometry
 
 DATASET_KEYS = ("weight", "caption", "loss_weight", "catalog", "import_to")
 log = get_logger(__name__)
@@ -87,7 +87,7 @@ def first_captions(
     """The first `n` non-empty rendered captions (variant 0) among the first `limit`
     rows of dataset entry `entry`, reading only those rows."""
     source = build_source(entry)
-    template = build_template(entry.get("caption", caption))
+    render = bind_template(build_template(entry.get("caption", caption)), source)
     if getattr(source, "catalog", None) is not None:
         catalog = source.catalog()
         rows = (catalog[i] for i in range(len(catalog)))
@@ -97,7 +97,7 @@ def first_captions(
         rows = source.scan()
     out = []
     for i, row in enumerate(rows):
-        text = template.render(row, rng_of("caption", seed, i, 0))
+        text = render(row, rng_of("caption", seed, i, 0), i)
         if text:
             out.append(text)
         if len(out) == n or i + 1 == limit:
@@ -122,6 +122,13 @@ def text_estimate(cfg: DataConfig, catalog: Catalog, templates: list) -> np.ndar
     per = np.float32(cfg.text_chars_per_token)
     tokens = np.ceil(chars.astype(np.float32) / per).astype(np.int64)
     return np.minimum(tokens + cfg.text_overhead_tokens, cfg.max_text_tokens)
+
+
+def text_chars_budget(cfg: DataConfig) -> int:
+    """The caption characters `max_text_tokens` holds under the estimate the planner uses
+    (`text_chars_per_token`, `text_overhead_tokens`)."""
+    tokens = max(cfg.max_text_tokens - cfg.text_overhead_tokens, 1)
+    return int(tokens * cfg.text_chars_per_token)
 
 
 def draw_drop(seed: int, p: float, index: int, rank: int, slot: int) -> bool:
@@ -192,6 +199,10 @@ class MossDataset:
         self._text_lengths = self.texts.lengths() if offline else LengthTable()
         self._bind()
         self.planner = self._planner()
+        self.renderers = [
+            bind_template(t, s, self.row_geometry, text_chars_budget(cfg))
+            for t, s in zip(self.templates, self.sources)
+        ]
 
     def _bind(self) -> None:
         cfg = self.cfg
@@ -199,32 +210,37 @@ class MossDataset:
             raise ValueError(f"token_budget must be one of {TOKEN_BUDGETS}")
         if cfg.token_budget == "exact" and cfg.text_cache != "offline":
             raise ValueError("token_budget='exact' needs text_cache='offline'")
-        self.text_len = {
-            ("estimate", "off"): self._text_len_columns,
-            ("estimate", "online"): self._text_len_columns,
-            ("estimate", "offline"): self._text_len_columns,
-            ("render", "off"): self._text_len_estimate,
-            ("render", "online"): self._text_len_estimate,
-            ("render", "offline"): self._text_len_cached,
-            ("exact", "offline"): self._text_len_exact,
+        cls = type(self)
+        self._text_len = {
+            ("estimate", "off"): cls._text_len_columns,
+            ("estimate", "online"): cls._text_len_columns,
+            ("estimate", "offline"): cls._text_len_columns,
+            ("render", "off"): cls._text_len_estimate,
+            ("render", "online"): cls._text_len_estimate,
+            ("render", "offline"): cls._text_len_cached,
+            ("exact", "offline"): cls._text_len_exact,
         }[(cfg.token_budget, cfg.text_cache)]
         self._drop = (
             partial(draw_drop, cfg.seed, cfg.text_drop) if cfg.text_drop else never_drop
         )
         self._fill_latents = {
-            "off": self._latents_decode,
-            "offline": self._latents_offline,
-            "online": self._latents_online,
+            "off": cls._latents_decode,
+            "offline": cls._latents_offline,
+            "online": cls._latents_online,
         }[cfg.latent_cache]
         self._fill_text = {
-            "off": self._text_prompts,
-            "offline": self._text_offline,
-            "online": self._text_online,
+            "off": cls._text_prompts,
+            "offline": cls._text_offline,
+            "online": cls._text_online,
         }[cfg.text_cache]
         latent_online = cfg.latent_cache == "online"
         text_online = cfg.text_cache == "online"
-        self._put_latents = self._write_latents if latent_online else nothing
-        self._put_text = self._write_text if text_online else nothing
+        self._put_latents = cls._write_latents if latent_online else nothing
+        self._put_text = cls._write_text if text_online else nothing
+
+    def text_len(self, row_id: int, variant: int) -> int:
+        """Text tokens of caption `variant` of row `row_id` under the token budget."""
+        return self._text_len(self, row_id, variant)
 
     def _planner(self):
         cfg = self.cfg
@@ -240,6 +256,7 @@ class MossDataset:
             max_tokens=cfg.max_tokens,
             max_samples=cfg.max_samples,
             batch_size=cfg.batch_size,
+            balance=cfg.grad_acc if cfg.data_balance else 0,
         )
         kwargs.update(cfg.planner_kwargs)
         return PLANNERS.get(cfg.resolution_mode)(**kwargs)
@@ -247,8 +264,15 @@ class MossDataset:
     def caption(self, row_id: int, variant: int) -> str:
         """Caption variant `variant` of row `row_id` (fixed per seed, row, variant)."""
         row = self.catalog[row_id]
-        template = self.templates[int(self.catalog.source[row_id])]
-        return template.render(row, rng_of("caption", self.cfg.seed, row_id, variant))
+        render = self.renderers[int(self.catalog.source[row_id])]
+        return render(row, rng_of("caption", self.cfg.seed, row_id, variant), row_id)
+
+    def row_geometry(self, row_id: int) -> RowGeometry:
+        """Row `row_id`'s stored size, planned target and centre crop box."""
+        w, h = int(self.catalog.w[row_id]), int(self.catalog.h[row_id])
+        target = tuple(self.planner.targets[row_id])
+        crop = self.geometry.center_box(w, h, target, None)
+        return RowGeometry(w, h, target, crop)
 
     def _live_text(self) -> np.ndarray:
         return self._text_est[np.asarray(self.catalog.live, dtype=bool)]
@@ -339,8 +363,8 @@ class MossDataset:
             rank=rank,
             text_limit=[it.text_limit for it in items],
         )
-        self._fill_latents(batch, items)
-        self._fill_text(batch, captions)
+        self._fill_latents(self, batch, items)
+        self._fill_text(self, batch, captions)
         return batch
 
     @staticmethod
@@ -356,7 +380,7 @@ class MossDataset:
         return [self.latents.get(k) for k in keys]
 
     def _latents_decode(self, batch: HostBatch, items) -> None:
-        batch.pixels = [self.pixels(it) for it in items]
+        batch.pixels = [torch.from_numpy(self.pixels(it)) for it in items]
 
     def _latents_offline(self, batch: HostBatch, items) -> None:
         found = self._latent_lookup(batch, items)
@@ -427,6 +451,6 @@ class MossDataset:
         `latents` is packed [N_img, C] in batch order; `text` is one tensor per sample;
         a cache that is not online ignores its argument."""
         if latents is not None:
-            self._put_latents(batch, latents)
+            self._put_latents(self, batch, latents)
         if text is not None:
-            self._put_text(batch, text)
+            self._put_text(self, batch, text)

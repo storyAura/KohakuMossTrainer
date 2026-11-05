@@ -7,7 +7,7 @@ runs/bench/step/<gpu>_<variant>.json. See docs/internals/offload.md.
         --datasets '[{"source": "kohya", "path": "<dataset>"}]' \
         --device cuda:0 --profiles balanced,low,minimal
     python scripts/bench/step/step.py --weights <root>/base --datasets '[...]' \
-        --profiles low --text-weights <root>/base --text-plan '{"memory": "stream"}'
+        --profiles low --text-weights <root>/base --text-plan '{"memory": "ring"}'
 
 With --text-weights the trainer encodes every batch's captions online with the real
 text encoder under --text-plan (TEXT_CACHE off): the row then carries the text-encoder
@@ -77,6 +77,7 @@ def knobs(args, profile: str, out_dir: str) -> dict:
         NUM_WORKERS=0,
         STEPS=args.iters + 1,
         LOG_EVERY=1,
+        METRICS_LEVEL="debug",
         SAVE_EVERY=0,
         SAMPLE_EVERY=0,
         VALIDATE_EVERY=0,

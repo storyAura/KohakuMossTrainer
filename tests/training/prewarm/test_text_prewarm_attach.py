@@ -14,6 +14,7 @@ from kohakumoss.training.callbacks import kernels as step_kernels
 from kohakumoss.training.state import TrainState
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_kernels.hardware import memory
+from tests._util.memory import read_window
 from tests._util.negative import must_fail
 from tests.training.knobs.test_knobs import runnable
 from tests.training.memory.test_vram_accounting import FakeMem, gib
@@ -27,7 +28,9 @@ CPU = torch.device("cpu")
 def _encoder(log: list) -> QwenTextEncoder:
     """An encoder shell whose pass only logs (no model)."""
     te = object.__new__(QwenTextEncoder)
-    te._run = lambda prompts: log.append(("pass", tuple(prompts))) or []
+    te._run = lambda enc, prompts, limits=None: (
+        log.append(("pass", tuple(prompts))) or []
+    )
     return te
 
 
@@ -44,8 +47,8 @@ def check_once_before(attach) -> None:
 def _after_each(te, fn):
     run = te._run
 
-    def each(prompts):
-        out = run(prompts)
+    def each(enc, prompts, limits=None):
+        out = run(enc, prompts, limits)
         fn()
         return out
 
@@ -104,7 +107,7 @@ def check_step_one(fake, late: bool) -> None:
         step_kernels.late_prewarm(CUDA, 4.0)
     fake.set(4.0)
     fake.set(2.0)
-    step_alloc = memory.read_window(vram.window)[0]
+    step_alloc = read_window(vram.window)[0]
     vram.on_step_end(TrainState(), None)
     speed.on_step_end(None, None)
     assert step_alloc == gib(4.0), step_alloc / gib(1.0)

@@ -1,4 +1,4 @@
-"""Metric sinks (rank 0 only): console + metrics.jsonl, KohakuBoard, wandb. A fresh run
+"""Metric sinks (rank 0 only): console + metrics.jsonl, wandb. A fresh run
 moves an earlier attempt's files aside (`fresh_run`); a resumed run keeps the rows up
 to its step and appends (`resume_at`)."""
 
@@ -6,23 +6,18 @@ import json
 import time
 from pathlib import Path
 
+from kohakumoss.logging.keys import named_row
 from kohakumoss.logging.log import get_logger
 
 METRICS = "metrics.jsonl"
-RUN_FILES = (METRICS, "log.txt", "board")
+RUN_FILES = (METRICS, "log.txt")
+WANDB_ID = "WANDB_ID"
 log = get_logger(__name__)
 
 try:
     import wandb
 except ImportError:
     wandb = None
-try:
-    from kohakuboard.client import Board, Media
-    from kohakuboard.logger import init_logger_settings as board_log_settings
-except ImportError:
-    Board = None
-    Media = None
-    board_log_settings = None
 
 
 def free_name(path: Path) -> Path:
@@ -48,8 +43,8 @@ def rotate(path: Path | str) -> Path | None:
 
 
 def fresh_run(output_dir: str | Path) -> list[Path]:
-    """A run that does not resume: an earlier attempt's metrics.jsonl, log.txt and
-    board directory in `output_dir` move aside (WARNING each); the moved paths."""
+    """A run that does not resume: an earlier attempt's metrics.jsonl and log.txt in
+    `output_dir` move aside (WARNING each); the moved paths."""
     moved = []
     for name in RUN_FILES:
         dst = rotate(Path(output_dir) / name)
@@ -90,6 +85,8 @@ class ConsoleLogger:
         self.path = Path(output_dir) / METRICS
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.file = self.path.open("a", encoding="utf-8")
+        self.pending: list[str] = []
+        self.failing = False
 
     def resume_at(self, step: int) -> None:
         """A run resumed at `step`: rows past it (an attempt that went on after that
@@ -109,10 +106,20 @@ class ConsoleLogger:
         self.file = self.path.open("a", encoding="utf-8")
 
     def log(self, metrics: dict, step: int) -> None:
-        self.file.write(
-            json.dumps({"step": step, "time": time.time(), **metrics}) + "\n"
-        )
-        self.file.flush()
+        """Append the row; rows a failed write (OSError) left behind are kept and
+        written first on the next call (one warning per failing streak)."""
+        row = json.dumps({"step": step, "time": time.time(), **metrics}) + "\n"
+        self.pending.append(row)
+        try:
+            self.file.write("".join(self.pending))
+            self.file.flush()
+        except OSError as err:
+            if not self.failing:
+                log.warning(f"{self.path}: write failed ({err}); rows kept for later")
+            self.failing = True
+            return
+        self.pending.clear()
+        self.failing = False
 
     def log_images(self, key: str, images: list, step: int) -> None:
         return None
@@ -121,42 +128,13 @@ class ConsoleLogger:
         self.file.close()
 
 
-class BoardLogger(ConsoleLogger):
-    """KohakuBoard run under `<output>/board`, plus the console/jsonl sink. The console
-    shows what it shows under LOGGER='console': KohakuBoard's own log lines go to
-    `<output>/board/kohakuboard.log` only, and it captures no stdout / stderr."""
-
-    def __init__(self, output_dir: str, name: str, project: str, config: dict):
-        super().__init__(output_dir)
-        if Board is None:
-            raise SystemExit("LOGGER='board' needs the `kohakuboard` package installed")
-        base = Path(output_dir) / "board"
-        board_log_settings(log_file=base / "kohakuboard.log", file_only=True)
-        self.board = Board(
-            name=name,
-            project=project,
-            base_dir=str(base),
-            config=config,
-            capture_output=False,
-        )
-
-    def log(self, metrics: dict, step: int) -> None:
-        super().log(metrics, step)
-        self.board.step()
-        self.board.log(**{f"train/{k}": v for k, v in metrics.items()})
-
-    def log_images(self, key: str, images: list, step: int) -> None:
-        self.board.log(**{key: Media(images)})
-
-    def close(self) -> None:
-        super().close()
-        self.board.finish()
-
-
 class WandbLogger(ConsoleLogger):
-    """wandb run, plus the console/jsonl sink. `mode` None is wandb's own default
+    """wandb run, plus the console/jsonl sink; wandb gets every metric under its
+    grouped name (`logging.keys.named_row`). `mode` None is wandb's own default
     (WANDB_MODE when set, else online). The console shows what it shows under
-    LOGGER='console': wandb runs silent and captures no console output."""
+    LOGGER='console': wandb runs silent and captures no console output. The run id
+    is kept in `<output>/WANDB_ID`; a resumed run (`resume`) continues that wandb
+    run, a fresh run starts a new one."""
 
     def __init__(
         self,
@@ -165,22 +143,31 @@ class WandbLogger(ConsoleLogger):
         project: str,
         config: dict,
         mode: str | None = None,
+        resume: bool = False,
     ):
         super().__init__(output_dir)
         if wandb is None:
             raise SystemExit("LOGGER='wandb' needs the `wandb` package installed")
+        id_file = Path(output_dir) / WANDB_ID
+        stored = resume and id_file.is_file()
+        run_id = id_file.read_text(encoding="utf-8").strip() if stored else ""
+        if resume and not run_id:
+            log.warning(f"resumed run without {id_file}: a new wandb run starts")
         self.run = wandb.init(
             project=project,
             name=name,
             config=config,
             dir=output_dir,
             mode=mode,
+            id=run_id or None,
+            resume="allow" if run_id else None,
             settings=wandb.Settings(silent=True, console="off"),
         )
+        id_file.write_text(self.run.id, encoding="utf-8")
 
     def log(self, metrics: dict, step: int) -> None:
         super().log(metrics, step)
-        self.run.log(metrics, step=step)
+        self.run.log(named_row(metrics), step=step)
 
     def log_images(self, key: str, images: list, step: int) -> None:
         self.run.log({key: [wandb.Image(im) for im in images]}, step=step)

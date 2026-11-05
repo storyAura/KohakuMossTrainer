@@ -23,12 +23,16 @@ class SpanTimer:
 
     def __init__(self, dev: DeviceStreams, stats: dict):
         self.dm = dev.dm
-        self.cuda = dev.cuda
+        self.streamed = dev.streamed
         self.stats = stats
         self.copies: list = []
         self.waits: list = []
         self.mark_bytes = self.mark_syncs = 0
-        self.stamp = nothing
+        self._stamp = nothing
+
+    def stamp(self, stream):
+        """A span's start event on `stream` while timing is on, else None."""
+        return self._stamp(self, stream)
 
     def _event(self, stream):
         ev = self.dm.Event(enable_timing=True)
@@ -41,7 +45,7 @@ class SpanTimer:
             spans.append((start, self._event(stream)))
 
     def set(self, on: bool) -> None:
-        self.stamp = self._event if on and self.cuda else nothing
+        self._stamp = SpanTimer._event if on and self.streamed else nothing
 
     def cut(self) -> dict:
         """The copy / wait spans, GB moved and host syncs since the last cut, unread

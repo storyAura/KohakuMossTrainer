@@ -16,6 +16,8 @@ from kohakumoss.memory.runners import PlainRunner
 from kohakumoss.parallel.pipeline.parts import PartsCtx
 from kohakumoss.parallel.telemetry.timing import build_clock
 from kohakumoss.types.seqinfo import SeqInfo, build_seqinfo
+from kohakumoss_common.calls import nothing
+from kohakumoss_common.weak import weak_method
 from kohakumoss_data.config import DataConfig, pipeline_problems
 
 SCHEDULES = {
@@ -262,7 +264,9 @@ class StageModule(nn.Module):
         self.residual = parts.residual_scale
         self.boundary = boundary
         self._blocks = tuple((i, self.layers[str(i)]) for i in range(lo, hi))
-        self._forward = self._forward_first if first else self._forward_mid
+        self._forward = (
+            StageModule._forward_first if first else StageModule._forward_mid
+        )
 
     def set_step(self, seqs: list[SeqInfo], inputs: list[MicroBatch]) -> None:
         self.seqs, self.inputs = seqs, inputs
@@ -274,7 +278,7 @@ class StageModule(nn.Module):
         return x.to(self.boundary)
 
     def forward(self, *args, mb: int):
-        return self._forward(*args, mb=mb)
+        return self._forward(self, *args, mb=mb)
 
     def _forward_first(self, token: Tensor, mb: int):
         x, ctx = self._prologue(self.inputs[mb], self.seqs[mb])
@@ -328,14 +332,6 @@ class TimedStage(pipelining.PipelineStage):
         return out
 
 
-def _no_capture(sigma: Tensor, seq: SeqInfo) -> None:
-    return None
-
-
-def _no_install(state) -> None:
-    return None
-
-
 class PipelineEngine:
     """This rank's stages and schedule; `step(microbatches, denom)` runs forward +
     backward of the step and returns its loss on every rank.
@@ -366,11 +362,11 @@ class PipelineEngine:
             raise ValueError("; ".join(problems))
         self.rank, self.world, self.device, self.shape = rank, world, device, shape
         self.dtype = compute_dtype
-        self.boundary = getattr(parts, "stream_dtype", compute_dtype)
+        self.boundary = getattr(parts, "residual_dtype", compute_dtype)
         self.cond_grad = parts.conditioning_trainable()
         self.group = group
-        self.capture: Callable = _no_capture
-        self.install: Callable = _no_install
+        self.capture: Callable = nothing
+        self.install: Callable = nothing
         self.states: list = [None] * shape.microbatches
         ids = stage_ids(rank, world, schedule, per_rank)
         n_stages = world * len(ids)
@@ -411,12 +407,13 @@ class PipelineEngine:
             self.call["arg_mbs"] = [(token,)] * m
         if self.last:
             self.call["target_mbs"] = list(range(m))
-        self._check = self._check_layouts
+        self._check = PipelineEngine._check_layouts
         self.pad_tokens = 0
         self.real_tokens = 0
         cls = schedule_class(schedule)
         target = stages[0] if schedule in SINGLE else stages
-        self.schedule = cls(target, m, loss_fn=self._loss, scale_grads=False)
+        loss = weak_method(self._loss)
+        self.schedule = cls(target, m, loss_fn=loss, scale_grads=False)
 
     def _example(self, first: bool):
         """Static stage metadata: `(token,)` into the first stage, else `(x, mod,
@@ -441,7 +438,7 @@ class PipelineEngine:
             output_args=self._example(False),
             group=group,
             clock=self.clock,
-            on_chunk=self._install_chunk,
+            on_chunk=weak_method(self._install_chunk),
         )
 
     def _install_chunk(self, k: int) -> None:
@@ -477,12 +474,12 @@ class PipelineEngine:
                 "pipeline ranks drew different micro-batches (layout / sigma digests "
                 "differ): every stage must see the same step"
             )
-        self._check = _no_check
+        self._check = nothing
 
     def step(self, microbatches: list[MicroBatch], denom: float) -> Tensor:
         """One forward + backward over the step; the step's loss (summed over its
         micro-batches, still times the loss scale) on every rank."""
-        self._check(microbatches)
+        self._check(self, microbatches)
         seqs = [padded_seqinfo(mb, self.shape).to(self.device) for mb in microbatches]
         moved = [microbatch_to(mb, self.device) for mb in microbatches]
         for m in self.modules_:
@@ -542,7 +539,3 @@ class TokenLoss:
     def __call__(self, pred: Tensor, data: MicroBatch, seg: Tensor) -> Tensor:
         loss = self.token_loss(pred, data.target, seg, data.weight, None)
         return loss * self.scaler.scale
-
-
-def _no_check(microbatches) -> None:
-    return None

@@ -22,6 +22,7 @@ from kohakumoss.cli.config.validate import (
     config_problems,
     load_knobs,
     problems,
+    warnings_of,
 )
 from kohakumoss_data import DataConfig, resolved_cache_dir
 from tests._util.negative import must_fail
@@ -139,7 +140,9 @@ def _fsdp_on_8_ranks(k: dict) -> None:
     assert k["PARALLEL"] == "fsdp" and k["DEVICES"] == tuple(range(8)), k["PARALLEL"]
 
 
-def test_full_ft_picks_fsdp_only_where_its_shards_fit(tmp_path):
+def test_full_ft_picks_fsdp_only_where_its_shards_fit(tmp_path, monkeypatch):
+    assert _full_ft(tmp_path / "pcie", "8", "32")["PARALLEL"] == "ddp"
+    monkeypatch.setattr(starter, "peer_linked", lambda gpus: True)
     _fsdp_on_8_ranks(_full_ft(tmp_path / "a", "8", "32"))
     k = _full_ft(tmp_path / "b", "2", "24")
     swap = load_knobs(presets.layer(ROOT, "moss", "vram", "24g_full"))
@@ -166,7 +169,7 @@ def test_ddp_layer_keeps_the_vram_profile(tmp_path):
     """The VRAM layer's catalog profile runs unchanged under the ddp layer."""
     out, _ = new_train(tmp_path, "--gpus", "2", "--vram", "12", "--precision", "bf16")
     _, k = config_knobs(out, ROOT)
-    assert k["MEMORY_PROFILE"] == "ckpt-stream4-actoff-optstream-gradoff"
+    assert k["MEMORY_PROFILE"] == "ckpt-ring4-actoff-optstream-gradoff"
     assert not k.get("MEMORY_OVERRIDES"), k.get("MEMORY_OVERRIDES")
 
 
@@ -267,7 +270,8 @@ def test_sample(tmp_path, vram, precision):
     expected = "" if layer == "auto" else train["MEMORY_PROFILE"]
     assert k["MEMORY_PROFILE"] == expected
     assert not k["TEXT_ENCODE"] and not k["VAE_ENCODE"] and not k["TEXT_DEVICE"]
-    assert problems(SAMPLE, {**k, "PRECISION": "fp16", "FP16_FIX": "none"})
+    unfixed = {**k, "PRECISION": "fp16", "FP16_FIX": "none"}
+    assert warnings_of(SAMPLE, unfixed) and not blocking(problems(SAMPLE, unfixed))
 
 
 def test_check_command(tmp_path, capsys):

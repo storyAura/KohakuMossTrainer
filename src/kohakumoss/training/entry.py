@@ -1,11 +1,12 @@
 """`run(globals())`: validate every knob, build in the fixed order, train, export."""
 
 import json
+import multiprocessing
+import os
 from functools import partial
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 
 from kohakumoss.adapters.lycoris.tuning import (
     restore_lycoris_tuning,
@@ -25,7 +26,9 @@ from kohakumoss.logging.log import (
 from kohakumoss.memory.device_use import build_device_use
 from kohakumoss.memory.timeline import build_timeline
 from kohakumoss.model import resolve_config
+from kohakumoss.model.compile import compile_model
 from kohakumoss.offload.accel import configure_allocator, release_cache
+from kohakumoss.parallel.fsdp import shard_like
 from kohakumoss.parallel.launch import (
     gate_name,
     ranks_meet,
@@ -42,6 +45,7 @@ from kohakumoss.training.build.kernels import (
     attach_text_prewarm,
     build_adapter_prewarm,
     build_prewarm,
+    build_teacher_prewarm,
 )
 from kohakumoss.training.build.loop import (
     build_ahead,
@@ -67,8 +71,16 @@ from kohakumoss.training.build.model import (
 )
 from kohakumoss.training.build.pipelines import release_nonlocal
 from kohakumoss.training.callbacks.evaluate import FixedSigma
+from kohakumoss.training.checkpoint.io import load_trainable
 from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
+from kohakumoss.training.encode import EncodeFeed, RankFeed, StreamedLoader, pin_batches
+from kohakumoss.training.exports import (
+    export_bytes,
+    export_files,
+    fused_qkv,
+    log_export_plan,
+)
 from kohakumoss.training.knobs import check, default_device_type, is_full, run_name
 from kohakumoss.training.layouts import Layout, layout_of
 from kohakumoss.training.memory.optimizers import close_memory
@@ -76,9 +88,13 @@ from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import LayoutTransform
 from kohakumoss.tuning.prewarm import prewarm_devices, release_workspaces, tunes
 from kohakumoss.types.plans import ParallelPlan
-from kohakumoss_data import DataConfig, build_loader
+from kohakumoss_common.calls import nothing
+from kohakumoss_data import DataConfig, MossDataset, build_loader
+from kohakumoss_kernels import compile_setup
+from kohakumoss_kernels.dist import dist_rank, initialized
 from kohakumoss_kernels.run_state import reset_run_state
 from kohakumoss_kernels.tuning import decisions, window
+from kohakumoss_kernels.tuning.tuner import clear_caps
 from kohakumoss_kernels.tuning.tuner import set_mode as set_tune_mode
 
 _device_type = default_device_type
@@ -92,26 +108,72 @@ def run(g: dict):
     shutdown.install()
     setup()
     k = check(g)
-    if layout_of(k).spawns and not dist.is_initialized():
-        plan = ParallelPlan(
-            kind=k["PARALLEL"],
-            backend=k["DIST_BACKEND"],
-            devices=tuple(k["DEVICES"]),
-            schedule=k["PIPELINE_SCHEDULE"],
-            microbatches=k["MICROBATCHES"],
-            timeout_s=float(k["DIST_TIMEOUT"]),
-            bind=k["DIST_BIND"],
-        )
-        return spawn(worker_env, plan, k, device_type=_device_type())
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world = dist.get_world_size() if dist.is_initialized() else 1
+    if k["ENCODE_DEVICES"] and not initialized():
+        return run_fed(k)
+    if layout_of(k).spawns and not initialized():
+        return spawn(worker_env, parallel_plan(k), k, device_type=_device_type())
+    rank, world = dist_rank()
     return worker(k, rank, world)
 
 
-def worker_env(env, k: dict) -> TrainState:
-    """Spawned-process entry: `env` is kohakumoss.parallel.launch.DistEnv."""
+def parallel_plan(k: dict) -> ParallelPlan:
+    """The ParallelPlan of the process-group layouts."""
+    return ParallelPlan(
+        kind=k["PARALLEL"],
+        backend=k["DIST_BACKEND"],
+        devices=tuple(k["DEVICES"]),
+        schedule=k["PIPELINE_SCHEDULE"],
+        microbatches=k["MICROBATCHES"],
+        timeout_s=float(k["DIST_TIMEOUT"]),
+        bind=k["DIST_BIND"],
+    )
+
+
+def run_fed(k: dict) -> None:
+    """A run with ENCODE_DEVICES: this process runs the encode feed (data loading,
+    the encoder processes, the batch streams) and the training runs in processes of
+    its own: one per device for the process-group layouts, else one."""
+    layout = layout_of(k)
+    world = len(k["DEVICES"]) if layout.spawns else 1
+    feed = EncodeFeed(k, layout, world, _device_type())
+    feed.start()
+    try:
+        if layout.spawns:
+            spawn(
+                worker_env,
+                parallel_plan(k),
+                k,
+                feed.handles,
+                device_type=_device_type(),
+            )
+        else:
+            run_child(worker_child, k, feed.handles[0])
+    finally:
+        feed.close()
+
+
+def run_child(fn, *args) -> None:
+    """`fn(*args)` in one spawned child process, joined; a failing child raises."""
+    proc = multiprocessing.get_context("spawn").Process(target=fn, args=args)
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"the training process exited with code {proc.exitcode}")
+
+
+def worker_env(env, k: dict, feeds: list | None = None) -> TrainState:
+    """Spawned-process entry: `env` is kohakumoss.parallel.launch.DistEnv; `feeds`
+    holds every rank's end of the encode feed (ENCODE_DEVICES)."""
     setup(rank=env.rank, world=env.world)
-    return worker(k, env.rank, env.world, env.device)
+    feed = None if feeds is None else feeds[env.rank]
+    return worker(k, env.rank, env.world, env.device, feed)
+
+
+def worker_child(k: dict, feed: RankFeed) -> None:
+    """The training process of a single-process layout under the encode feed."""
+    shutdown.install()
+    setup()
+    worker(k, 0, 1, None, feed)
 
 
 def writer_first(rank: int, world: int, build):
@@ -141,15 +203,6 @@ def _device(k: dict, rank: int) -> torch.device:
             return torch.device("cpu")
 
 
-def _compile(backbone, mode: str) -> None:
-    match mode:
-        case "block":
-            for block in backbone.layers:
-                block.compile(dynamic=True)
-        case "model":
-            backbone.compile(dynamic=True)
-
-
 def _snapshot(k: dict) -> dict:
     return json.loads(json.dumps(k, default=str))
 
@@ -158,7 +211,8 @@ def _start(k: dict, layout: Layout, rank: int, device: torch.device):
     """(output dir, precision, the LyCORIS tuning switch to restore): the run directory
     and its files on rank 0, the per-run process state, the run line."""
     allocator = configure_allocator(device)
-    torch.manual_seed(k["SEED"])  # identical model + adapter init on every rank
+    compile_pool = compile_setup.apply()
+    torch.manual_seed(k["SEED"])
     output_dir = str(Path(k["OUTPUT_DIR"]) / run_name(k))
     if rank == 0:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -181,7 +235,7 @@ def _start(k: dict, layout: Layout, rank: int, device: torch.device):
     log.info(
         f"run {hl(run_name(k))}: {hl(k['ALGO'])} {hl(k['PRECISION'])} on {device}, "
         f"{hl(k['STEPS'])} steps, output {hl(output_dir, 'path')}, allocator "
-        f"{hl(allocator)}"
+        f"{hl(allocator)}, compile pool: {hl(compile_pool)}"
     )
     return output_dir, prec, lycoris_tuning
 
@@ -189,7 +243,7 @@ def _start(k: dict, layout: Layout, rank: int, device: torch.device):
 def _data(k: dict, layout: Layout, rank: int, world: int, device):
     """(data knobs, token-layout transform, training loader): the catalog scan and
     batch plan over `layout`'s data ranks (rank 0 writes the catalog first)."""
-    data_rank = layout.stream_rank(rank)
+    data_rank = layout.data_rank(rank)
     data_world = layout.data_world(world)
     kd = data_knobs(k, device)
     data_cfg = DataConfig.from_knobs(kd)
@@ -204,6 +258,20 @@ def _data(k: dict, layout: Layout, rank: int, world: int, device):
     return kd, tokens, loader
 
 
+def _fed_data(k: dict, layout: Layout, rank: int, world: int, device, feed: RankFeed):
+    """(data knobs, token-layout transform, StreamedLoader) of a rank under the encode
+    feed: the feed's data knobs, the dataset read only (the feed wrote the catalog),
+    batches from the feed."""
+    kd = feed.knobs
+    cfg = DataConfig.from_knobs(kd)
+    arch = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
+    tokens = LayoutTransform(arch.rope_axes)
+    dataset = MossDataset(cfg, writer=False)
+    devices = ", ".join(str(i) for i in k["ENCODE_DEVICES"])
+    pin = pin_batches(device, cfg.pin_memory)
+    return kd, tokens, StreamedLoader(feed, dataset, pin, devices)
+
+
 def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
     """The kernel prewarm (weightless twin, segment counts from the dataset) and the
     adapter prewarm, before the stage split and the gradient-sync hooks; the
@@ -214,6 +282,9 @@ def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
         return warm
     with timed(log, f"kernel prewarm on {warm} (fwd + bwd, {prec.compute})"):
         build_prewarm(k, built, prec, device, dataset)(warm)
+    if built.teacher is not None:
+        with timed(log, f"teacher kernel prewarm on {warm} (fwd)"):
+            build_teacher_prewarm(k, built.teacher, dataset)(warm)
     decisions.flush("after the kernel prewarm")
     release_workspaces(warm)
     adapters = adapter_prewarm_devices(k, device)
@@ -224,23 +295,51 @@ def _prewarm(k: dict, built, prec, device, dataset, device_use) -> list:
     return warm
 
 
-def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
-    """One rank of a run."""
+def init_weights(k: dict, built, output_dir: str) -> bool:
+    """INIT_FROM on a fresh run (no RESUME checkpoint in `output_dir`): the trainable
+    state of that checkpoint into the live trainable set (re-sharded like it), before
+    the optimiser and EMA copy their masters from it; returns whether it loaded."""
+    init = k.get("INIT_FROM")
+    if not init or resumed_from(k, output_dir) is not None:
+        return False
+    if not os.path.isfile(os.path.join(init, "trainable.safetensors")):
+        raise SystemExit(
+            f"INIT_FROM={init!r} is not a checkpoint dir (no trainable.safetensors)"
+        )
+    log.info(f"weights from {init} (optimiser, schedule and data fresh)")
+    live = built.trainable
+    live.load_state_dict(shard_like(load_trainable(init), live.state_dict()))
+    built.engines.after_restore()
+    return True
+
+
+def worker(
+    k: dict, rank: int = 0, world: int = 1, device=None, feed: RankFeed | None = None
+) -> TrainState:
+    """One rank of a run; `feed`: the rank's end of the encode feed (ENCODE_DEVICES)."""
     is_main = rank == 0
     layout = layout_of(k)
     device = device or _device(k, rank)
     output_dir, prec, lycoris_tuning = _start(k, layout, rank, device)
     device_use = build_device_use(device)
-    data_rank = layout.stream_rank(rank)
+    data_rank = layout.data_rank(rank)
     data_world = layout.data_world(world)
-    kd, tokens, loader = _data(k, layout, rank, world, device)
+    if feed is None:
+        kd, tokens, loader = _data(k, layout, rank, world, device)
+    else:
+        kd, tokens, loader = _fed_data(k, layout, rank, world, device, feed)
     ranks_meet("data")
-    torch.manual_seed(k["SEED"])  # the build's init does not depend on the scan
+    torch.manual_seed(k["SEED"])
+    streamed = None if feed is None else loader
     with timed(log, "building model, adapters and encoders"):
-        built = build_model(k, device, prec, world, loader.dataset.text_tokens_max())
+        built = build_model(
+            k, device, prec, world, loader.dataset.text_tokens_max(), streamed
+        )
     log_object(log, "training memory plan", built.plan)
     for message, fields in placement_lines(k, built, device):
         log.info(message, **fields)
+    files = export_files(k, fused_qkv(k))
+    log_export_plan(k, files, export_bytes(files, built.trainable, built.backbone))
     release_cache(device)
     device_use.log(log, "after build")
     warm = _prewarm(k, built, prec, device, loader.dataset, device_use)
@@ -253,7 +352,8 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         release_nonlocal(built.backbone, keep)
     torch.manual_seed(k["SEED"] + rank)  # per-rank stream for everything after build
     hooks = layout.hooks(ctx)
-    _compile(built.backbone, built.plan.compile)
+    init_weights(k, built, output_dir)
+    compile_model(built.backbone, built.plan.compile)
     normalizer = TokenNormalizer(hooks.reduce, hooks.world_factor)
     autocast = autocast_factory(prec, device)
     stage_devices = [torch.device(device.type, i) for i in k["DEVICES"]]
@@ -267,15 +367,17 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         normalizer,
         autocast,
         device,
-        stream_rank=data_rank,
+        data_rank=data_rank,
         forward=hooks.forward,
         recorder=recorder,
     )
-    bundle, accumulate = build_optim(k, built, device, prec, hooks, keep)
+    resumed = resumed_from(k, output_dir) is not None
+    bundle, accumulate = build_optim(k, built, device, prec, hooks, keep, resumed)
     if objective is not None:
         objective.scaler = bundle.scaler
     ema = build_ema_for(k, built, bundle, names, rank)
-    writer = build_writer(k, loader, writes=data_rank == rank, rank=rank)
+    writes = data_rank == rank and built.feed is None
+    writer = build_writer(k, loader, writes=writes, rank=rank)
     loader, batcher = _inputs(k, built, device, loader, writer)
     timeline = build_timeline(device)
     for enc in (built.text_encoder, built.vae):
@@ -289,16 +391,25 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         k.get("PROJECT", "kohakumoss"),
         _snapshot(k),
         is_main,
+        resume=resumed_from(k, output_dir) is not None,
     )
 
     def make_step(sampler: FixedSigma):
         return build_step(
-            k, built, normalizer, autocast, device, sampler, stream_rank=data_rank
+            k,
+            built,
+            normalizer,
+            autocast,
+            device,
+            sampler,
+            data_rank=data_rank,
+            penalty=False,
         )
 
     rng_devices = stage_devices if layout.stage_rng else warm
     ckpt = build_checkpoints(k, output_dir, ema, is_main, writer, rank, rng_devices)
     parts = _parts(ctx, (ema, bundle, step, loader), names)
+    ckpt.after_save = checkpoint_exports(k, layout, built, parts, is_main)
     rank_cbs = _rank_callbacks(ctx, [hooks.timing, *sources], share, traced)
     runner = build_callbacks(
         ctx,
@@ -339,6 +450,7 @@ def worker(k: dict, rank: int = 0, world: int = 1, device=None) -> TrainState:
         logger.close()
         restore_lycoris_tuning(lycoris_tuning)
         window.reopen()
+        clear_caps()
     return state
 
 
@@ -374,9 +486,15 @@ def _inputs(k: dict, built, device, loader, writer):
 
 
 def _validation_batches(k: dict, built, device, kd, tokens, rank, world) -> list:
-    """The fixed validation batches on `device` (none when VALIDATE_EVERY is 0)."""
+    """The fixed validation batches on `device` (none when VALIDATE_EVERY is 0; the
+    encode feed's under the feed)."""
     if k["VALIDATE_EVERY"] <= 0:
         return []
+    if built.feed is not None:
+        count = int(k["VALIDATION"].get("batches", 4))
+        return fixed_batches(
+            built.feed.validation(), build_batcher(k, built, device), count
+        )
     val_loader = writer_first(
         rank,
         world,
@@ -399,20 +517,44 @@ def _parts(ctx: RunContext, live: tuple, names) -> Parts:
     return ctx.layout.parts(ctx, (ctx.built.trainable, *live), names, extra)
 
 
-def _export(
-    k: dict, layout: Layout, built, parts, state, output_dir: str, is_main: bool
+def export_into(
+    k: dict, layout: Layout, built, parts, step: int, root: Path, is_main: bool
 ) -> None:
-    """Every EXPORT_FORMATS output of the trained state (rank 0 writes; every rank
-    takes part in the stage merge and the FSDP2 unshard)."""
+    """Every export file of the trained state at `step` under `root` (rank 0 writes;
+    every rank takes part in the stage merge and the FSDP2 unshard)."""
     parts.before_export()
     with layout.full_weights(built.backbone):
         if is_main:
-            meta = {
-                "kohakumoss_step": str(state.step),
-                "kohakumoss_algo": str(k["ALGO"]),
-            }
-            for path in export(k, built, output_dir, meta):
-                log.info(f"exported {path}")
+            meta = {"kohakumoss_step": str(step), "kohakumoss_algo": str(k["ALGO"])}
+            try:
+                for path in export(k, built, root, meta):
+                    log.info(f"exported {path}")
+            except OSError as err:
+                log.error(f"export of step {step} into {root} failed: {err}")
+
+
+def _export(
+    k: dict, layout: Layout, built, parts, state, output_dir: str, is_main: bool
+) -> None:
+    """The run's final exports under `<output>/export/` (none with SAVE_FORMAT
+    'none')."""
+    if k["SAVE_FORMAT"] == "none":
+        return
+    root = Path(output_dir) / "export"
+    export_into(k, layout, built, parts, state.step, root, is_main)
+
+
+def checkpoint_exports(k: dict, layout: Layout, built, parts, is_main: bool):
+    """`after_save(step, path)` of the CheckpointManager: the exports into
+    `<checkpoint>/export/` (CHECKPOINT_EXPORT; every rank calls it, rank 0 writes)."""
+    if not k["CHECKPOINT_EXPORT"] or k["SAVE_FORMAT"] == "none":
+        return nothing
+
+    def after_save(step: int, path: Path | None) -> None:
+        root = (path or Path()) / "export"
+        export_into(k, layout, built, parts, step, root, is_main)
+
+    return after_save
 
 
 def close_quietly(writer) -> None:

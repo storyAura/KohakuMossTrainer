@@ -5,19 +5,17 @@ docs/concepts/data.md#loader."""
 import multiprocessing
 import sys
 from collections.abc import Callable
+from functools import partial
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
+from kohakumoss_common.calls import identity
 from kohakumoss_common.devices import streamed_type
 from kohakumoss_common.imports import import_object
 
 WORKER_START = "spawn" if sys.platform == "win32" else "forkserver"
 WORKER_LOOP = "torch.utils.data._utils.worker"
-
-
-def identity(batch):
-    return batch
 
 
 def pinnable() -> bool:
@@ -41,6 +39,11 @@ def worker_context(*shipped):
         names = ["__main__", WORKER_LOOP, *(_module(obj) for obj in shipped)]
         ctx.set_forkserver_preload(list(dict.fromkeys(names)))
     return ctx
+
+
+def share_like(strategy: str, worker_id: int) -> None:
+    """Loader-worker init: the tensor sharing strategy of the loader's process."""
+    torch.multiprocessing.set_sharing_strategy(strategy)
 
 
 def resolve_transform(transform: Callable | str | None) -> Callable:
@@ -114,6 +117,8 @@ class Loader:
             kwargs["multiprocessing_context"] = worker_context(
                 self.dataset, self.transform
             )
+            strategy = torch.multiprocessing.get_sharing_strategy()
+            kwargs["worker_init_fn"] = partial(share_like, strategy)
         return DataLoader(
             stream,
             batch_size=None,

@@ -34,7 +34,7 @@ from kohakumoss.training.checks.parallel import (
     threaded_problems,
 )
 from kohakumoss.training.context import RunContext
-from kohakumoss.training.drivers import DRIVERS, Parts
+from kohakumoss.training.drivers import NativeDriver, Parts
 from kohakumoss.training.drivers.common import ShardedOptimParts
 from kohakumoss.training.drivers.fsdp import FsdpParts
 from kohakumoss.training.drivers.pipeline import (
@@ -70,14 +70,22 @@ def _ddp_hooks(ctx: RunContext) -> ParallelHooks:
     k = ctx.k
     match k["DDP_BACKEND"]:
         case "kohakumoss":
-            return ddp_hooks(ctx.built, ctx.device, k["DDP_REDUCE_DTYPE"])
+            return ddp_hooks(
+                ctx.built,
+                ctx.device,
+                k["DDP_REDUCE_DTYPE"],
+                k.get("DDP_BUCKET_MB", 25),
+            )
         case "torch":
             return torch_ddp_hooks(ctx.built, ctx.device, k["DDP_REDUCE_DTYPE"])
     raise SystemExit(f"DDP_BACKEND={k['DDP_BACKEND']!r} not in {DDP_BACKENDS}")
 
 
 def _fsdp_hooks(ctx: RunContext) -> ParallelHooks:
-    return fsdp_hooks(ctx.built.backbone, ctx.world, ctx.k["FSDP_REDUCE"])
+    k = ctx.k
+    return fsdp_hooks(
+        ctx.built.backbone, ctx.world, k["FSDP_REDUCE"], k["FSDP_RESHARD"]
+    )
 
 
 def _pipeline_hooks(ctx: RunContext) -> ParallelHooks:
@@ -85,7 +93,7 @@ def _pipeline_hooks(ctx: RunContext) -> ParallelHooks:
 
 
 def _plain_parts(ctx: RunContext, args: tuple, names, extra) -> Parts:
-    if getattr(ctx.built.engines.stream, "owners", None) is not None:
+    if getattr(ctx.built.engines.weight_stream, "owners", None) is not None:
         return ShardedOptimParts(*args, extra=extra)
     return Parts(*args, extra=extra)
 
@@ -101,7 +109,7 @@ def _pipeline_parts(ctx: RunContext, args: tuple, names, extra) -> Parts:
 
 
 def _loop_driver(ctx: RunContext, common: dict, accumulate, engine):
-    return DRIVERS.get(ctx.k["DRIVER"])(**common, accumulate=accumulate)
+    return NativeDriver(**common, accumulate=accumulate)
 
 
 def _threaded_driver(ctx: RunContext, common: dict, accumulate, engine):
@@ -156,7 +164,7 @@ class Layout:
     pipelined: bool = False
     stage_rng: bool = False
 
-    def stream_rank(self, rank: int) -> int:
+    def data_rank(self, rank: int) -> int:
         """The rank whose data, sigma and noise streams this rank draws."""
         return 0 if self.shared_data else rank
 

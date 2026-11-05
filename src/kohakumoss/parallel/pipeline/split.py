@@ -106,9 +106,10 @@ def measure_costs(
     iters: int = 3,
 ) -> StageCosts:
     """Median ms of forward + backward of every block (through `runner`, as training
-    runs it), the prologue and the epilogue at the probe micro-batch on `device`; the
-    parameter gradients it leaves are cleared, and the caller's CPU and `device` random
-    generators are left where they were."""
+    runs it), the prologue and the epilogue at the probe micro-batch on `device`; a
+    block's parameter gradients are cleared once it is timed (one block's exist at a
+    time), every gradient it leaves is cleared, and the caller's CPU and `device`
+    random generators are left where they were."""
     with rng_kept([device]):
         return _measured(parts, shape, device, autocast, runner, warmup, iters)
 
@@ -120,7 +121,7 @@ def _measured(parts, shape, device, autocast, runner, warmup, iters) -> StageCos
     used = int((hw[:, 0] * hw[:, 1]).sum() + text_len.sum())
     seq = padded_layout(hw, text_len, None, used, shape).to(device)
     grad = parts.conditioning_trainable()
-    dtype = parts.stream_dtype
+    dtype = parts.residual_dtype
     x = torch.randn(shape.tokens, shape.dim, device=device, dtype=dtype)
     x.requires_grad_()
     mod = 0.1 * torch.randn(shape.slots, 6, shape.dim, device=device)
@@ -138,7 +139,12 @@ def _measured(parts, shape, device, autocast, runner, warmup, iters) -> StageCos
 
         return run
 
-    layers = [_median(layer(i), timer, warmup, iters) for i in range(len(parts.layers))]
+    def timed_layer(i):
+        ms = _median(layer(i), timer, warmup, iters)
+        parts.layers[i].zero_grad(set_to_none=True)
+        return ms
+
+    layers = [timed_layer(i) for i in range(len(parts.layers))]
     img = torch.randn(seq.n_img, cfg.latent_channels, device=device)
     text = torch.randn(seq.n_txt, cfg.text_dim, device=device, dtype=dtype)
     sigma = torch.rand(seq.batch, device=device)

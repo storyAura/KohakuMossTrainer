@@ -7,14 +7,14 @@ docs/internals/offload.md for their derivation and the probe that calibrates the
 from dataclasses import dataclass, field
 
 from kohakumoss.memory.profiles import checkpoint_mode
-from kohakumoss.offload.optim import gpu_adamw
-from kohakumoss.offload.optim import grad as grad_offload_ring
+from kohakumoss.offload.optim.gpu_adamw import state_ring_bytes
+from kohakumoss.offload.optim.grad import grad_ring_bytes
 from kohakumoss.offload.optim.stream_optim import slot_bytes
 from kohakumoss.quant.compute import COMPUTE as FP8_COMPUTE
 from kohakumoss.types.arch import MossArchConfig
 from kohakumoss.types.plans import MemoryPlan
+from kohakumoss_common.units import GIB
 
-GIB = 1024**3
 PRECISION_BYTES = {
     "compute": None,
     "bf16": 2,
@@ -24,7 +24,9 @@ PRECISION_BYTES = {
     "int8": 1,
     "fp8_compute": 1,
     "mxfp8": 1 + 1 / 32,
+    "w4a8": 0.5 + 1 / 16,
 }
+QUANTIZED = ("fp8", "int8", "w4a8", *FP8_COMPUTE)
 HOST_STATES = ("stream", "cpu")
 CONTEXT_BYTES = int(0.88 * GIB)  # device memory outside the torch allocator
 WORKSPACE_BYTES = int(0.25 * GIB)
@@ -37,10 +39,14 @@ ACT_FACTOR = {"fused": 1.0, "eager": 3.6}
 class Workload:
     """What one rank runs per micro-step. `sharded`: parameters sharded over `world`
     ranks (FSDP2); `sharded_grads`: their gradients sharded too (False while FSDP2
-    accumulates unsharded gradients across micro-batches); `ema_decays`: fp32 EMA
+    accumulates unsharded gradients across micro-batches); `gathered`: every sharded
+    block also held unsharded from its forward through backward (FSDP_RESHARD=
+    'backward', ZeRO-2); `ema_decays`: fp32 EMA
     averages kept of every trainable parameter (on its device; `swap` block masters
     and their averages live on the host); `master_bytes`: a full finetune's trainable
-    device parameter (fp32 master, the compute dtype under adamw16)."""
+    device parameter (fp32 master, the compute dtype under adamw16);
+    `stored_precision`: the base precision the checkpoint stores (what a plan's
+    `auto` keeps; `model.io.load.stored_precision`)."""
 
     arch: MossArchConfig
     img_tokens: int
@@ -51,14 +57,21 @@ class Workload:
     world: int = 1
     sharded: bool = False
     sharded_grads: bool = True
+    gathered: bool = False
     act_factor: float = ACT_FACTOR["fused"]
     ema_decays: int = 0
     optim_state_bytes: int = 8
     master_bytes: int = 4
+    stored_precision: str = "compute"
 
     @property
     def tokens(self) -> int:
         return self.img_tokens + self.txt_tokens
+
+
+def base_precision(plan: MemoryPlan, stored: str = "compute") -> str:
+    """The base precision a plan runs: the checkpoint's `stored` one under `auto`."""
+    return stored if plan.base_precision == "auto" else plan.base_precision
 
 
 def fragmentation(plan: MemoryPlan) -> float:
@@ -180,13 +193,19 @@ def recompute_window(arch: MossArchConfig, mode: str) -> int:
 
 
 def weight_bytes(
-    plan: MemoryPlan, compute_bytes: int, training: bool, full_ft: bool = False
+    plan: MemoryPlan,
+    compute_bytes: int,
+    training: bool,
+    full_ft: bool = False,
+    stored: str = "compute",
 ) -> float:
-    """Stored bytes per base parameter: the compute dtype, a quantized format, plus the
-    W^T copy of an fp8 input gradient in training; a trainable fp8-compute weight keeps
-    its 16-bit copy next to the fp8 ones."""
-    wb = PRECISION_BYTES.get(plan.base_precision) or compute_bytes
-    fp8 = plan.base_precision in FP8_COMPUTE
+    """Stored bytes per base parameter: the compute dtype, a quantized format (the
+    checkpoint's `stored` one under `auto`), plus the W^T copy of an fp8 input gradient
+    in training; a trainable fp8-compute weight keeps its 16-bit copy next to the fp8
+    ones."""
+    precision = base_precision(plan, stored)
+    wb = PRECISION_BYTES.get(precision) or compute_bytes
+    fp8 = precision in FP8_COMPUTE
     copies = 2 if training and fp8 and plan.fp8_dgrad == "fp8" else 1
     return wb * copies + (compute_bytes if fp8 and full_ft else 0)
 
@@ -195,11 +214,12 @@ def _transients(est: Estimate, work: Workload, plan: MemoryPlan) -> None:
     """Per-call buffers of a quantized base: a dequantized layer (weight-only, and the
     fp8 path's 16-bit fallback) and the fp8 activation copy."""
     arch, cb = work.arch, work.compute_bytes
-    if plan.base_precision not in ("fp8", "int8", *FP8_COMPUTE):
+    precision = base_precision(plan, work.stored_precision)
+    if precision not in QUANTIZED:
         return
     largest = 2 * arch.ffn_dim * arch.dim
     est.parts["dequant"] = (block_params(arch) + 2 * largest) * cb
-    if plan.base_precision in FP8_COMPUTE:
+    if precision in FP8_COMPUTE:
         est.parts["fp8_act"] = work.tokens * 2 * arch.ffn_dim
 
 
@@ -210,11 +230,11 @@ def estimate_inference(work: Workload, plan: MemoryPlan) -> Estimate:
     est = Estimate(fragmentation=fragmentation(plan))
     est.parts["context"] = CONTEXT_BYTES
     est.parts["workspace"] = WORKSPACE_BYTES
-    wb = weight_bytes(plan, cb, training=False)
+    wb = weight_bytes(plan, cb, training=False, stored=work.stored_precision)
     blocks = arch.depth * block_params(arch)
     rest = total_params(arch) - blocks
-    resident = min(max(plan.stream_resident, 2), arch.depth) * block_params(arch)
-    placed = rest + (resident if plan.stream != "off" else blocks)
+    ring_params = min(max(plan.stream_resident, 2), arch.depth) * block_params(arch)
+    placed = rest + (ring_params if plan.stream != "off" else blocks)
     est.parts["weights"] = int(placed * wb)
     est.parts["activations"] = int(
         work.tokens * saved_per_token(arch, "none") * work.act_factor * cb
@@ -231,17 +251,21 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
     est.parts["context"] = CONTEXT_BYTES
     est.parts["workspace"] = WORKSPACE_BYTES
 
-    wb = weight_bytes(plan, cb, training=True, full_ft=work.full_ft)
+    wb = weight_bytes(
+        plan, cb, training=True, full_ft=work.full_ft, stored=work.stored_precision
+    )
     # full FT: device parameters are the masters (+ the fp8 copies of fp8 compute)
     pb = work.master_bytes + wb - cb if work.full_ft else wb
     blocks = arch.depth * block_params(arch)
     rest = total_params(arch) - blocks
     shard = work.world if work.sharded else 1
     if plan.stream != "off":
-        resident = max(plan.stream_resident, 2) * block_params(arch)
-        est.parts["weights"] = int(rest * pb + resident * wb)
+        ring_params = max(plan.stream_resident, 2) * block_params(arch)
+        est.parts["weights"] = int(rest * pb + ring_params * wb)
     else:
         est.parts["weights"] = int((rest + blocks) * pb) // shard
+        if work.sharded and work.gathered:
+            est.parts["gathered"] = int(blocks * pb)
 
     grad_offload = plan.grad_offload
     if work.full_ft:
@@ -256,13 +280,13 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
             est.parts["optim"] = n * state_bytes(work, plan) // shard
         swap = plan.stream == "swap"
         if swap and plan.optim_state != "cpu":
-            resident = plan.optim_state == "gpu"
-            est.parts["optim_slots"] = slot_bytes(block_params(arch), cb, resident)
+            device_states = plan.optim_state == "gpu"
+            est.parts["optim_slots"] = slot_bytes(block_params(arch), cb, device_states)
         largest = largest_device_param(arch, swap)
         if plan.optim_state == "stream":
-            est.parts["state_ring"] = gpu_adamw.ring_bytes(largest)
+            est.parts["state_ring"] = state_ring_bytes(largest)
         if grad_offload:
-            est.parts["grad_ring"] = grad_offload_ring.ring_bytes(largest)
+            est.parts["grad_ring"] = grad_ring_bytes(largest)
         on_device = n - blocks if swap else n
         est.parts["ema"] = 4 * work.ema_decays * on_device // shard
     if work.trainable_params:
@@ -280,8 +304,8 @@ def estimate(work: Workload, plan: MemoryPlan) -> Estimate:
         per_tok *= f
     stored = n_ckpt * per_tok + (arch.depth - n_ckpt) * per_tok_full
     if plan.act_offload:
-        resident = max(plan.act_offload_inflight, 2)
-        stored = resident * max(
+        act_blocks = max(plan.act_offload_inflight, 2)
+        stored = act_blocks * max(
             per_tok, per_tok_full if n_ckpt < arch.depth else per_tok
         )
     est.parts["activations"] = int(work.tokens * stored * cb)

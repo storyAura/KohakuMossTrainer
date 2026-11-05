@@ -19,7 +19,7 @@ param(
     [ValidateSet("cuda", "xpu")] [string] $Device = "cuda",
     # GPU index within that kind: cuda -> CUDA_VISIBLE_DEVICES (nvidia-smi order), xpu -> ZE_AFFINITY_MASK.
     [int] $Index = 0,
-    # Weights root (HF layout); the text encoder, VAE and tokenizer are loaded from here.
+    # Weights: a ComfyUI models folder or an HF weights root; the text encoder, VAE and tokenizer are loaded from here.
     [string] $Weights = $env:KOHAKUMOSS_WEIGHTS,
     # Arch preset: base | sft (on a root with base\ / sft\ folders, WEIGHTS\<variant>\ is read).
     [ValidateSet("base", "sft")] [string] $Variant = "base",
@@ -42,8 +42,9 @@ param(
     # fp16 residual fix when no -Transformer is given: online | fp32_residual | none.
     [ValidateSet("online", "fp32_residual", "none")] [string] $Fp16Fix = "online",
     # Text-encoder placement: auto = fastest that fits; resident = whole TE on the GPU; offload = moved in
-    # per prompt batch; stream = layers streamed from host RAM (~2 GB on the GPU); cpu = run on the CPU.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $TextMemory = "auto",
+    # per prompt batch; ring = layers streamed from host RAM (~2 GB on the GPU; "stream" is accepted too);
+    # cpu = run on the CPU.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $TextMemory = "auto",
     # Text-encoder precision: compute = bf16 / fp16; int8 / fp8 = quantized weight storage (16-bit math);
     # fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
     [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $TextPrecision = "compute",
@@ -52,15 +53,15 @@ param(
     # Free the text encoder after it encoded the prompts.
     [switch] $FreeTextEncoder,
     # DiT base: compute = bf16 / fp16; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
-    [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "compute",
+    [ValidateSet("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "auto",
     # DiT fp8_compute scaling: row | tensor | block.
     [ValidateSet("row", "tensor", "block")] [string] $Fp8Recipe = "row",
     # DiT memory profile: auto = the fastest profile that fits the card's free memory | minimal (2 resident
     # blocks, the rest streamed; fits 8 GB) | low | balanced (16 resident) | any catalog name (see train.ps1)
     # | "" = whole DiT on the GPU (~10 GB in 16 bit).
     [string] $Memory = "auto",
-    # VAE placement: auto = fastest that fits | resident | offload | stream | cpu.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $VaeMemory = "auto",
+    # VAE placement: auto = fastest that fits | resident | offload | ring (block rings; "stream" is accepted too) | cpu.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $VaeMemory = "auto",
     # VAE dtype: auto (bf16 where supported, else fp16) | bf16 | fp16 | fp32.
     [ValidateSet("auto", "bf16", "fp16", "fp32")] [string] $VaeDtype = "auto",
     # Adapters to apply: one or more "path" or "path:multiplier" (LyCORIS / ComfyUI LoRA, LoKr, LoHa ... files).

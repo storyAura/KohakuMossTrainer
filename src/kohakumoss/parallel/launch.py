@@ -2,11 +2,15 @@
 runs `fn(env, *args)` in one process per device. See
 docs/internals/distributed-launch.md."""
 
+import contextlib
 import itertools
 import multiprocessing
 import os
+import shutil
+import signal
 import sys
 import tempfile
+import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,11 +21,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from kohakumoss.types.plans import ParallelPlan
+from kohakumoss_kernels.dist import COLLECTIVE_DEVICE, grouped
+from kohakumoss_kernels.dist import dist_rank as dist_rank
 
 IS_WINDOWS = sys.platform == "win32"
 TIMEOUT_S = 600.0  # default DIST_TIMEOUT: seconds a collective / the store waits
 RANK0_WAIT_S = 7200.0  # default DIST_GATE_TIMEOUT: seconds a store gate waits
-DEVICE_BACKENDS = ("nccl", "xccl")
+EXIT_WAIT_S = 30.0  # seconds a terminated rank process gets before it is killed
+DEVICE_BACKENDS = tuple(COLLECTIVE_DEVICE)
 BINDS = ("lazy", "device")
 _GATES = itertools.count()
 _STARTUP = {"timeout_s": RANK0_WAIT_S}
@@ -169,13 +176,6 @@ def rank0_value(
     return wait_for_rank0(name, store, timeout_s)
 
 
-def dist_rank() -> tuple[int, int]:
-    """(rank, world) of the default process group; (0, 1) without one."""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    return 0, 1
-
-
 def startup_barrier(
     name: str, world: int, store=None, timeout_s: float | None = None
 ) -> None:
@@ -191,8 +191,28 @@ def startup_barrier(
 def ranks_meet(what: str) -> None:
     """`startup_barrier` over the default process group (nothing without one or with
     one rank); a distinct gate per call."""
-    if dist.is_initialized() and dist.get_world_size() > 1:
+    if grouped():
         startup_barrier(gate_name(what), dist.get_world_size())
+
+
+def store_agree(
+    name: str, ok: bool, world: int, store=None, timeout_s: float | None = None
+) -> bool:
+    """Every rank: whether `ok` holds on all `world` ranks at gate `name` (the store's
+    failure count after a `startup_barrier`)."""
+    s = _store(store)
+    key = f"kohakumoss/{name}/failed"
+    s.add(key, 0 if ok else 1)
+    startup_barrier(name, world, s, timeout_s)
+    return s.add(key, 0) == 0
+
+
+def ranks_agree(what: str, ok: bool) -> bool:
+    """`store_agree` over the default process group (`ok` itself without one or with
+    one rank); a distinct gate per call."""
+    if not grouped():
+        return ok
+    return store_agree(gate_name(what), ok, dist.get_world_size())
 
 
 def gate_name(what: str) -> str:
@@ -241,7 +261,9 @@ def _entry(local_rank, fn, cfg, args):
 
 def spawn(fn, plan: ParallelPlan, *args, device_type: str = "cuda") -> None:
     """Run `fn(env, *args)` on every device of `plan` (one process each); `fn` must be
-    a module-level function (spawned processes import it)."""
+    a module-level function (spawned processes import it). The `init="file"`
+    rendezvous directory is removed when the job ends: on a normal exit, a failing
+    rank, or SIGTERM to the launcher (which also ends the rank processes)."""
     backend = default_backend(device_type) if plan.backend == "auto" else plan.backend
     addr = "localhost" if IS_WINDOWS else "127.0.0.1"
     world = len(plan.devices)
@@ -254,6 +276,9 @@ def spawn(fn, plan: ParallelPlan, *args, device_type: str = "cuda") -> None:
         wait_for_workers=False,
         use_libuv=not IS_WINDOWS,
     )
+    rendezvous = (
+        tempfile.mkdtemp(prefix="kohakumoss_dist_") if plan.init == "file" else ""
+    )
     cfg = dict(
         devices=tuple(plan.devices),
         device_type=device_type,
@@ -264,13 +289,49 @@ def spawn(fn, plan: ParallelPlan, *args, device_type: str = "cuda") -> None:
         bind=plan.bind,
         addr=addr,
         port=store.port,
-        file=os.path.join(tempfile.mkdtemp(prefix="kohakumoss_dist_"), "init"),
+        file=os.path.join(rendezvous, "init") if rendezvous else "",
     )
-    mp.spawn(_entry, args=(fn, cfg, args), nprocs=world, join=True)
-    del store
+    try:
+        with _sigterm_exits():
+            _run(fn, cfg, args, world)
+    finally:
+        if rendezvous:
+            shutil.rmtree(rendezvous, ignore_errors=True)
+        del store
 
 
-def local_env(device: torch.device | str = "cuda") -> DistEnv:
-    """The single-process environment (no process group)."""
-    device = torch.device(device)
-    return DistEnv(0, 1, 0, device, "none")
+def _run(fn, cfg: dict, args: tuple, world: int) -> None:
+    """The rank processes, joined; any still running when the join ends early (a
+    SIGTERM) are terminated, then killed after EXIT_WAIT_S."""
+    context = mp.spawn(_entry, args=(fn, cfg, args), nprocs=world, join=False)
+    try:
+        while not context.join():
+            pass
+    finally:
+        alive = [p for p in context.processes if p.is_alive()]
+        for proc in alive:
+            proc.terminate()
+        for proc in alive:
+            proc.join(EXIT_WAIT_S)
+            if proc.is_alive():
+                proc.kill()
+
+
+def _exit_on_signal(signum, frame) -> None:
+    raise SystemExit(128 + signum)
+
+
+@contextlib.contextmanager
+def _sigterm_exits():
+    """Inside, SIGTERM to the (main-thread) launcher raises SystemExit so the job's
+    clean-up runs; the default handler is restored after. Off the main thread, or with
+    a SIGTERM handler already set, nothing changes."""
+    main = threading.current_thread() is threading.main_thread()
+    if not main or signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL:
+        yield
+        return
+    signal.signal(signal.SIGTERM, _exit_on_signal)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)

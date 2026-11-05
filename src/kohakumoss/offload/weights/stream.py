@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 from kohakumoss.model.linear import MossLinear
 from kohakumoss.offload.accel import module, streamed, with_index
+from kohakumoss.offload.host.arena import HostArena
 from kohakumoss.offload.weights.layers import host_copy
 from kohakumoss.offload.weights.shared import aligned, nbytes_of
 from kohakumoss.offload.weights.streamed_weights import (
@@ -31,8 +32,10 @@ from kohakumoss.offload.weights.streaming import (
     read_timing,
 )
 from kohakumoss.quant.compute import ComputeWeight
+from kohakumoss.quant.w4a8 import W4A8Weight
 from kohakumoss.quant.weights import QuantWeight
 from kohakumoss_common.calls import nothing
+from kohakumoss_common.hostmem import trim_heap
 
 __all__ = [
     "StreamedComputeWeight",
@@ -44,9 +47,14 @@ __all__ = [
 ]
 
 
+def steps_block(owners: list[int] | None, rank: int, index: int) -> bool:
+    """Rank `rank` steps block `index` under `owners` (every block when None)."""
+    return owners is None or owners[index] == rank
+
+
 class WeightStream:
     """Ring-buffer weight streaming over a sequence of identically shaped blocks. A
-    frozen ring keeps its first `resident - 2` blocks on the device once loaded and
+    frozen ring keeps its first `slots - 2` blocks on the device once loaded and
     cycles the rest through two slots; a trainable (`swap`) ring cycles every block.
 
     Trainable rings: `share(nbytes)` (DDP on one node) returns the SharedHost region the
@@ -55,13 +63,15 @@ class WeightStream:
 
     The stream owns the host copies (`host`, `params`, `layout`) and its parts: `ring`
     (SlotRing), `copier` (H2DCopier), `timer` (SpanTimer), `grads` (GradSink) and
-    `reducer` (BlockReducer); `stats` counts loads, bytes and host syncs over all."""
+    `reducer` (BlockReducer); `stats` counts loads, bytes and host syncs over all.
+    `optimizer` is a weak reference to the in-backward block optimiser (StreamedAdamW),
+    None without one."""
 
     def __init__(
         self,
         blocks: Sequence[nn.Module],
         device: torch.device | str,
-        resident: int = 2,
+        slots: int = 2,
         pinned: bool = True,
         trainable: bool = False,
         dtype: torch.dtype | None = None,
@@ -69,41 +79,50 @@ class WeightStream:
         owners: list[int] | None = None,
         rank: int = 0,
     ):
-        if resident < 2:
-            raise ValueError("resident must be >= 2")
+        if slots < 2:
+            raise ValueError("slots must be >= 2")
         self.device = with_index(torch.device(device))
-        self.cuda = streamed(self.device)
+        self.streamed = streamed(self.device)
         self.dm = module(self.device)
-        self.pinned = pinned and self.cuda
+        self.pinned = pinned and self.streamed
         self.trainable = trainable
         self.owners = owners
         self.rank = rank
         self.n = len(blocks)
-        resident = min(resident, self.n)
-        kept = self.n if resident == self.n else resident - 2
+        slots = min(slots, self.n)
+        kept = self.n if slots == self.n else slots - 2
         self.arena = None
         if trainable and share is not None:
             self.arena = share(self._shared_bytes(blocks, dtype))
-        host_pinned = self.pinned if self.arena is None else self.arena.pinned
         self.host: list[dict[str, Tensor]] = []
         self.params: dict[tuple[int, str], nn.Parameter] = {}
         self.layout: dict[str, tuple[torch.Size, torch.dtype]] = {}
-        for i, block in enumerate(blocks):
-            self.host.append(self._take(i, block, dtype))
+        self.host_arena = None
+        if trainable:
+            for i, block in enumerate(blocks):
+                self.host.append(self._take(i, block, dtype))
+        else:
+            self._take_frozen(blocks, dtype)
         if self.arena is not None:
             self.arena.ready()
+        host_pinned = self.pinned
+        if self.arena is not None:
+            host_pinned = self.arena.pinned
+        elif self.host_arena is not None:
+            host_pinned = self.host_arena.pinned
         self.stats = {"loads": 0, "bytes_h2d": 0, "bytes_d2h": 0, "host_syncs": 0}
-        dev = DeviceStreams(self.device, self.dm, self.cuda)
+        dev = DeviceStreams(self.device, self.dm, self.streamed)
         self.timer = SpanTimer(dev, self.stats)
         self.copier = H2DCopier(
-            dev, resident, self.n, host_pinned, trainable, self.stats, self.timer
+            dev, slots, self.n, host_pinned, trainable, self.stats, self.timer
         )
         keep = 0 if trainable else kept
         self.ring = SlotRing(
-            self.host, self.layout, self.device, resident, keep, self.copier, self.stats
+            self.host, self.layout, self.device, slots, keep, self.copier, self.stats
         )
         self.grads = GradSink(self.params, self.n, dev, self.pinned, self.stats)
-        self.reducer = BlockReducer(self.grads, dev, trainable, self.mine, self.stats)
+        mine = partial(steps_block, owners, rank)
+        self.reducer = BlockReducer(self.grads, dev, trainable, mine, self.stats)
         # the streamed weights' per-linear calls go straight to the parts
         self.slot, self.ensure = self.ring.slot, self.ring.ensure
         self.prefetch, self.release = self.ring.prefetch, self.ring.release
@@ -111,11 +130,14 @@ class WeightStream:
         self.on_grad = self.grads.accumulate
         self.on_block_backward = nothing
         self.optimizer = None
-        self._sync = partial(self.dm.synchronize, self.device) if self.cuda else nothing
+        self._sync = (
+            partial(self.dm.synchronize, self.device) if self.streamed else nothing
+        )
 
     @property
-    def resident(self) -> int:
-        return self.ring.resident
+    def slots(self) -> int:
+        """Device slots of the ring."""
+        return self.ring.n_slots
 
     @property
     def accumulate(self) -> Callable[[tuple[int, str], Tensor], None]:
@@ -160,7 +182,7 @@ class WeightStream:
 
     def mine(self, index: int) -> bool:
         """This rank steps block `index` (every block without owners)."""
-        return self.owners is None or self.owners[index] == self.rank
+        return steps_block(self.owners, self.rank, index)
 
     def _shared_pair(self, w: Tensor, work: torch.dtype) -> tuple[Tensor, Tensor]:
         """(streaming copy, fp32 master) views of the shared region, filled by rank 0."""
@@ -175,13 +197,19 @@ class WeightStream:
     def _take(self, index: int, block: nn.Module, dtype) -> dict[str, Tensor]:
         out = {}
         for name, lin in self._linears(block):
+            if isinstance(lin.base, W4A8Weight):
+                lin.set_base(lin.base.to_int8())
             if isinstance(lin.base, QuantWeight):
                 if self.trainable:
                     raise ValueError("a quantized base cannot be streamed trainably")
                 for part, t in (("q", lin.base.q), ("scale", lin.base.scale)):
                     out[f"{name}:{part}"] = self._host(t)
                     self.layout.setdefault(f"{name}:{part}", (t.shape, t.dtype))
-                lin.set_base(StreamedQuantWeight(self, index, name, lin.base.shape))
+                b = lin.base
+                base = StreamedQuantWeight(
+                    self, index, name, b.shape, b.rotation, b.int8_dgrad, dtype
+                )
+                lin.set_base(base)
                 continue
             if isinstance(lin.base, ComputeWeight):
                 if self.trainable:
@@ -212,6 +240,69 @@ class WeightStream:
             lin.set_base(StreamedWeight(self, index, name, w.shape))
         return out
 
+    @staticmethod
+    def _frozen_parts(name: str, lin: MossLinear, dtype) -> list[tuple]:
+        """(host key, tensor, host dtype) of each part a frozen linear streams: a
+        quantized base's stored parts (a W4A8 base at its int8 decode), else the dense
+        weight in `dtype`."""
+        if isinstance(lin.base, W4A8Weight):
+            lin.set_base(lin.base.to_int8())
+        if isinstance(lin.base, QuantWeight):
+            parts = (("q", lin.base.q), ("scale", lin.base.scale))
+            return [(f"{name}:{p}", t, t.dtype) for p, t in parts]
+        if isinstance(lin.base, ComputeWeight):
+            parts = lin.base.tensors().items()
+            return [(f"{name}:{p}", t, t.dtype) for p, t in parts]
+        w = lin.weight.detach()
+        return [(name, w, dtype or w.dtype)]
+
+    def _take_frozen(self, blocks: Sequence[nn.Module], dtype) -> None:
+        """Every frozen block's streamed parts copied into one HostArena (`host_arena`,
+        exact size, pinned when the stream is), each linear's base re-pointed at its
+        views as it goes, so the host sources are freed while the arena fills (the C
+        heap's freed pages returned after each block)."""
+        linears = [
+            (i, name, lin, self._frozen_parts(name, lin, dtype))
+            for i, block in enumerate(blocks)
+            for name, lin in self._linears(block)
+        ]
+        specs = [(t.shape, d) for *_, parts in linears for _, t, d in parts]
+        self.host_arena = arena = HostArena(specs, self.pinned, self.device)
+        self.host = [{} for _ in blocks]
+        k = 0
+        for j in range(len(linears)):
+            index, name, lin, parts = linears[j]
+            linears[j] = None
+            for key, t, d in parts:
+                self.host[index][key] = arena.fill(k, t)
+                self.layout.setdefault(key, (t.shape, d))
+                k += 1
+            parts = t = None
+            self._rebase(index, name, lin, dtype)
+            if j + 1 == len(linears) or linears[j + 1][0] != index:
+                trim_heap()
+        arena.finish()
+
+    def _rebase(self, index: int, name: str, lin: MossLinear, dtype) -> None:
+        """Point a frozen linear at its streamed form (its host parts are taken)."""
+        if isinstance(lin.base, QuantWeight):
+            b = lin.base
+            lin.set_base(
+                StreamedQuantWeight(
+                    self, index, name, b.shape, b.rotation, b.int8_dgrad, dtype
+                )
+            )
+            return
+        if isinstance(lin.base, ComputeWeight):
+            lin.set_base(StreamedComputeWeight(self, index, name, lin.base, dtype))
+            return
+        shape = lin.weight.shape
+        lin.weight = nn.Parameter(
+            torch.empty(0, dtype=lin.weight.dtype, device=self.device),
+            requires_grad=False,
+        )
+        lin.set_base(StreamedWeight(self, index, name, shape))
+
     def set_timing(self, on: bool) -> None:
         """Record copy and copy-wait spans on the device (read by `take_timing`)."""
         self.timer.set(on)
@@ -237,7 +328,7 @@ class WeightStream:
         self.release(index)
         return _Exit.apply(y, self, index)
 
-    def flush_grads(self) -> None:
+    def expose_grads(self) -> None:
         """Land every queued gradient and expose it as the host master's `.grad`."""
         self.grads.drain()
         self.reducer.synchronize()
@@ -255,8 +346,8 @@ class WeightStream:
         """Before each micro-batch of a host-stepped ring: under a cross-rank reduction
         (`reduce_with`) the last one sends each block's step gradient through it;
         otherwise gradients accumulate on the host."""
-        flush = self.reducer.reduce is not None
-        self.on_grad = self.reducer.collect if last and flush else self.accumulate
+        reducing = self.reducer.reduce is not None
+        self.on_grad = self.reducer.collect if last and reducing else self.accumulate
 
     def zero_grads(self) -> None:
         """End the step's host gradient sums (after the optimiser step): the next

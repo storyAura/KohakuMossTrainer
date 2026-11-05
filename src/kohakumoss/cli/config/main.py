@@ -2,8 +2,8 @@
 
     kohakumoss-config new --from lora_24g_bf16 my_run.py
     kohakumoss-config wizard
-    kohakumoss-config new train --weights <model dir> --data <dataset dir>
-    kohakumoss-config new sample --weights <model dir> --adapter <file>.safetensors
+    kohakumoss-config new train --weights <ComfyUI models dir> --data <dataset dir>
+    kohakumoss-config new sample --weights <ComfyUI models dir> --adapter <file>.safetensors
     kohakumoss-config list          (the named memory profiles)
     kohakumoss-config list --all    (every catalog profile)
     kohakumoss-config check my_run.py
@@ -36,12 +36,13 @@ from kohakumoss.cli.config.validate import (
     USER_DIR,
     blocking,
     compose,
-    config_problems,
+    config_knobs,
     is_checkout,
     problems,
     repo_root,
     script_ref,
     target_script,
+    warnings_of,
 )
 from kohakumoss.logging.log import get_logger, setup
 from kohakumoss.memory.catalog_table import markdown as profile_table
@@ -72,7 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="kind", required=True
     )
     train = new.add_parser("train", help="train config + data-preparation config")
-    train.add_argument("--weights", required=True, help="model dir (transformer/ ...)")
+    train.add_argument(
+        "--weights",
+        required=True,
+        help="ComfyUI models folder (diffusion_models/ ...) or HF model dir",
+    )
     train.add_argument("--data", required=True, help="dataset root")
     train.add_argument("--source", default="kohya", help="data preset (see `list`)")
     train.add_argument("--algo", default="lora", help="algo preset (see `list`)")
@@ -80,7 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--name", default="my-lora", help="RUN_NAME and file name")
     train.add_argument("--steps", type=int, default=0, help="0 = the base STEPS")
     sample = new.add_parser("sample", help="sample config")
-    sample.add_argument("--weights", required=True, help="model dir or weights root")
+    sample.add_argument(
+        "--weights",
+        required=True,
+        help="ComfyUI models folder, HF model dir or weights root",
+    )
     sample.add_argument("--adapter", action="append", default=[], help="path[:mult]")
     sample.add_argument("--name", default="sample", help="file name")
     sample.add_argument("--samples", default="runs/samples", help="output directory")
@@ -155,7 +164,7 @@ def _check(root: Path, st: Starter) -> dict:
     bad = blocking(found)
     if bad:
         raise SystemExit("the composed config is invalid:\n  - " + "\n  - ".join(bad))
-    for p in found:
+    for p in found + warnings_of(st.script, knobs):
         log.warning(p)
     return knobs
 
@@ -298,7 +307,11 @@ def wizard(root: Path, ask: Callable[[str], str] = input) -> None:
         ask, "dataset layout", presets.names(root, "moss", "data"), "kohya"
     )
     data = _ask(ask, "dataset path")
-    weights = _ask(ask, "weights path (dir with transformer/, text_encoder/, vae/)")
+    weights = _ask(
+        ask,
+        "weights path (a ComfyUI models folder with diffusion_models/, "
+        "text_encoders/, vae/, or an HF dir with transformer/, text_encoder/, vae/)",
+    )
     steps = int(_ask(ask, "steps (0 = the base value)", "0"))
     gpus = int(_ask(ask, "GPUs", "1"))
     name = _ask(ask, "run name", "my-lora")
@@ -341,13 +354,17 @@ def list_presets(root: Path, everything: bool = False) -> None:
 
 
 def check_configs(root: Path, paths: list[str]) -> int:
-    """Print every problem per config; returns the number of configs with problems."""
+    """Print every problem and warning per config; returns the number of configs with
+    problems."""
     bad = 0
     for path in paths:
-        found = config_problems(Path(path), root)
+        script, knobs = config_knobs(Path(path), root)
+        found = problems(script, knobs)
         print(f"{path}: {'ok' if not found else 'invalid'}")
         for p in found:
             print(f"  - {p}" + ("  (path)" if MISSING in p else ""))
+        for w in warnings_of(script, knobs):
+            print(f"  - {w}  (warning)")
         bad += bool(found)
     return bad
 

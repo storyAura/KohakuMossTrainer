@@ -9,16 +9,20 @@ from kohakumoss.diffusion.objective import LOSSES, WEIGHTINGS
 from kohakumoss.diffusion.timestep import TIMESTEPS
 from kohakumoss.encoders.knob_names import ENCODER_FIELDS, RENAMED_SAMPLE, SAMPLE_NAMES
 from kohakumoss.logging import LOGGERS
-from kohakumoss.memory.knob_map import mixing_problems, plan_fields
+from kohakumoss.logging.log import get_logger
+from kohakumoss.memory.knob_map import mixing_problems, plan_fields, primary_names
 from kohakumoss.memory.profiles import KNOB_FIELDS, ORDER, PROFILES, resolve
 from kohakumoss.memory.release import release_problems
 from kohakumoss.offload.accel import default_type
 from kohakumoss.precision import COMPUTE
+from kohakumoss.training.build.anchors import wd_target_problems
+from kohakumoss.training.checks.encode import encode_problems
 from kohakumoss.training.checks.encoders import text_problems, vae_problems
 from kohakumoss.training.checks.objective import (
     REAL_VARIANTS,
     carries_fp16_fix,
     objective_problems,
+    objective_warnings,
     schedule_problems,
 )
 from kohakumoss.training.checks.outputs import EXPORTS, io_problems
@@ -27,13 +31,22 @@ from kohakumoss.training.checks.parallel import (
     dist_backend,
     parallel_problems,
 )
+from kohakumoss.training.distill import distill_problems, distill_warnings
+from kohakumoss.training.exports import with_export_formats
 from kohakumoss.training.layouts import LAYOUTS
+from kohakumoss.training.optim.bundle.deferred import step_sync_problems
 from kohakumoss.training.optim.optimizers.factory import OPTIMIZERS
 from kohakumoss.training.optim.optimizers.kwargs import optimizer_problems
+from kohakumoss.training.optim.outlier import outlier_problems
+from kohakumoss.training.optim.outlier import spec_of as outlier_spec
+from kohakumoss.training.stream_loss import spec_of as stream_spec
+from kohakumoss.training.stream_loss import stream_loss_problems
 from kohakumoss.types.arch import PRESETS
 from kohakumoss.types.plans import MemoryPlan
 from kohakumoss_common.knobs import choice_problems, unknown_problems
 from kohakumoss_data import DataConfig, data_problems
+from kohakumoss_data.images.kc import READ_DEADLINE
+from kohakumoss_data.images.kc import TIMEOUT as READ_TIMEOUT
 from kohakumoss_kernels import ops as kernel_ops
 from kohakumoss_kernels.hardware.arch import arch_of
 from kohakumoss_kernels.tuning.tuner import MODES as TUNE_MODES
@@ -49,11 +62,13 @@ __all__ = [
     "dist_backend",
     "plan_problems",
     "validate",
+    "knob_warnings",
 ]
 
 KNOWN = frozenset(
-    """WEIGHTS VARIANT ARCH_OVERRIDES TEXT_ENCODER TEXT_DEVICE TEXT_ENCODE VAE
-    VAE_ENCODE VAE_DTYPE TRAIN_TEXT_REFINER FREEZE_BLOCKS DATASETS
+    """WEIGHTS VARIANT ARCH_OVERRIDES TRANSFORMER TEXT_ENCODER TEXT_DEVICE TEXT_ENCODE VAE
+    VAE_ENCODE VAE_DTYPE ENCODE_DEVICES ENCODE_DEPTH ENCODE_CHUNK TRAIN_TEXT_REFINER
+    FREEZE_BLOCKS DATASETS
     RESOLUTION_MODE TARGET_AREA SIZE_STEP ASPECT_RANGE UPSCALE MAX_TOKENS BATCH_SIZE
     CAPTION TEXT_DROP LATENT_CACHE TEXT_CACHE CACHE_DTYPE CACHE_DIR CAPTION_VARIANTS FLIP
     NUM_WORKERS SEED ALGO PRESET DIM ALPHA ALGO_KWARGS DORA DORA_DETACH DROPOUT
@@ -61,19 +76,24 @@ KNOWN = frozenset(
     BETAS EPS WEIGHT_DECAY WD_RULES SCHEDULE GRAD_CLIP EMA PRECISION KEEP_FP32 FP16_FIX
     FP16_FIX_KWARGS
     MEMORY_PROFILE MEMORY_AUTO_FORCE MEMORY_OVERRIDES STEP_RELEASE PARALLEL DIST_BACKEND DEVICES
-    PIPELINE_SCHEDULE PIPELINE_SPLIT TRACE_STEPS PROFILE_STEPS FSDP_REDUCE
-    DDP_BACKEND DDP_REDUCE_DTYPE DIST_TIMEOUT DIST_GATE_TIMEOUT DIST_BIND
+    PIPELINE_SCHEDULE PIPELINE_SPLIT TRACE_STEPS PROFILE_STEPS FSDP_REDUCE FSDP_RESHARD
+    DDP_BACKEND DDP_REDUCE_DTYPE DDP_BUCKET_MB DIST_TIMEOUT DIST_GATE_TIMEOUT DIST_BIND
     CHECKPOINT STREAM STREAM_RESIDENT PINNED ACT_OFFLOAD OPTIM_STATE GRAD_OFFLOAD
-    FUSED_STEP BASE_PRECISION FP8_RECIPE FP8_DGRAD
+    FUSED_STEP BASE_PRECISION FP8_RECIPE FP8_DGRAD INT8_COMPUTE INT8_DGRAD
     MICROBATCHES KERNELS TUNE RETUNE_STEPS COMPILE DRIVER STEPS GRAD_ACC OUTPUT_DIR RUN_NAME LOGGER
     LOG_EVERY METRICS_EVERY PROGRESS SAMPLE_PROMPTS SAMPLE_EVERY SAMPLE_STEPS SAMPLE_CFG SAMPLE_SHIFT
     SAMPLE_SKIP_LAYERS SAMPLE_SIZE SAMPLE_SEEDS VALIDATE_EVERY VALIDATION SAVE_EVERY
-    SAVE_MINUTES KEEP_LAST RESUME EXPORT_FORMATS WEIGHTING OPTIMIZER_KWARGS
+    SAVE_MINUTES KEEP_LAST FINAL_CHECKPOINT RESUME EXPORT_FORMATS SAVE_FORMAT SAVE_MERGED SAVE_FUSED_QKV
+    CHECKPOINT_EXPORT WEIGHTING OPTIMIZER_KWARGS
     SAMPLE_NEGATIVE PROJECT LORAPLUS_RATIO BATCHING OVERLONG MAX_SAMPLES TOKEN_BUDGET
     CROP PLANNER_KWARGS LATENT_ENCODER_ID LATENT_DRAW
     TEXT_ENCODER_ID BACKGROUND RESAMPLE TEXT_CHARS_PER_TOKEN TEXT_OVERHEAD_TOKENS
     MAX_TEXT_TOKENS PREFETCH PIN_MEMORY NONFINITE_PATIENCE DATA_RESCAN
-    DATA_SCAN_WORKERS DATA_WAIT""".split()
+    DATA_SCAN_WORKERS DATA_WAIT DATA_BALANCE CONCENTRATION_LOSS STREAM_LOSS STREAM_LOSS_PROBE
+    METRICS_LEVEL STEP_SYNC
+    SAMPLE_BATCH SAMPLE_COLUMNS SAMPLE_AT_START
+    INIT_FROM WD_TARGET TEACHER TEACHER_PRECISION TEACHER_STREAM DISTILL_WEIGHT
+    DISTILL_WEIGHTING HARD_WEIGHT OUTLIER_DECAY""".split()
 )
 CHOICES = {
     "ADAPTER_MODE": ("bypass", "merge"),
@@ -85,9 +105,12 @@ CHOICES = {
     "DRIVER": ("native", "lightning"),
     "FP16_FIX": ("none", "online", "fp32_residual"),
     "FSDP_REDUCE": ("step", "micro"),
+    "FSDP_RESHARD": ("forward", "backward"),
     "DDP_BACKEND": ("kohakumoss", "torch"),
-    "DDP_REDUCE_DTYPE": ("fp32", "param"),
+    "DDP_REDUCE_DTYPE": ("fp32", "param", "bf16"),
     "DIST_BIND": ("lazy", "device"),
+    "METRICS_LEVEL": ("train", "bench", "debug"),
+    "STEP_SYNC": ("step", "deferred"),
 }
 ALGOS = (
     "lora",
@@ -112,6 +135,7 @@ RENAMED = {
     "SIZE": "the train script's name is SAMPLE_SIZE",
 }
 default_device_type = default_type
+log = get_logger(__name__)
 
 
 def run_name(k: dict) -> str:
@@ -120,13 +144,16 @@ def run_name(k: dict) -> str:
 
 
 def is_full(k: dict) -> bool:
-    """Full finetune: the backbone's own weights train (no LyCORIS module)."""
+    """Full finetune: the backbone's own weights train."""
     return k["ALGO"] == "full"
 
 
 def collect(g: dict) -> dict:
-    """UPPER_CASE globals of the train script (after the config was applied)."""
-    return {k: v for k, v in g.items() if k.isupper() and not k.startswith("_")}
+    """UPPER_CASE globals of the train script (after the config was applied), with
+    MEMORY_PROFILE in its primary spelling (`primary_names`)."""
+    return primary_names(
+        {k: v for k, v in g.items() if k.isupper() and not k.startswith("_")}
+    )
 
 
 def _registry_ok(name, registry) -> bool:
@@ -198,9 +225,10 @@ def _value_problems(k: dict) -> list[str]:
     ):
         if not _registry_ok(k[name], reg):
             p.append(f"{name}={k[name]!r} not in {reg.names()}")
-    weighting = k.get("WEIGHTING", "none")
-    if not _registry_ok(weighting, WEIGHTINGS):
-        p.append(f"WEIGHTING={weighting!r} not in {WEIGHTINGS.names()}")
+    for name in ("WEIGHTING", "DISTILL_WEIGHTING"):
+        weighting = k.get(name) or "none"
+        if not _registry_ok(weighting, WEIGHTINGS):
+            p.append(f"{name}={weighting!r} not in {WEIGHTINGS.names()}")
     if k["LR"] <= 0:
         p.append(f"LR must be positive, got {k['LR']}")
     if k["STEPS"] <= 0 or k["GRAD_ACC"] < 1:
@@ -225,7 +253,18 @@ def _value_problems(k: dict) -> list[str]:
     retune = k.get("RETUNE_STEPS", 0)
     if isinstance(retune, bool) or not isinstance(retune, int) or retune < 0:
         p.append(f"RETUNE_STEPS must be an int >= 0, got {retune!r}")
+    bucket = k.get("DDP_BUCKET_MB", 25)
+    if isinstance(bucket, bool) or not isinstance(bucket, int) or bucket < 1:
+        p.append(f"DDP_BUCKET_MB must be an int >= 1, got {bucket!r}")
     p += release_problems(k.get("STEP_RELEASE", "none"))
+    stall = 2 * (READ_DEADLINE + READ_TIMEOUT[1])
+    if len(k["DEVICES"]) > 1 and float(k["DIST_TIMEOUT"]) < stall:
+        p.append(
+            f"DIST_TIMEOUT={k['DIST_TIMEOUT']} s is shorter than {stall:.0f} s: a rank "
+            "whose image read is being retried would time the collectives out"
+        )
+    if not isinstance(k.get("INIT_FROM") or "", str):
+        p.append(f"INIT_FROM must be a checkpoint dir path, got {k['INIT_FROM']!r}")
     return p + freeze_problems(k)
 
 
@@ -253,10 +292,16 @@ def validate(k: dict) -> list[str]:
     p += _memory_problems(k)
     p += text_problems(k, arch_of)
     p += vae_problems(k)
+    p += encode_problems(k, arch_of)
     layout = _layout(k)
     p += parallel_problems(k, layout.problems if layout is not None else None)
     p += optimizer_problems(k)
     p += io_problems(k)
+    p += stream_loss_problems(k)
+    p += step_sync_problems(k)
+    p += wd_target_problems(k, is_full(k))
+    p += outlier_problems(k, is_full(k))
+    p += distill_problems(k)
     return list(dict.fromkeys(p))
 
 
@@ -293,6 +338,25 @@ def plan_problems(k: dict, plan: MemoryPlan) -> list[str]:
             "profile without 'optfused' / stream for full FT (e.g. 'ckpt-resident') or "
             "FUSED_STEP=False with MEMORY_PROFILE='manual'"
         )
+    if plan.checkpoint == "sub-block" and stream_spec(k):
+        p.append(
+            "checkpoint='sub-block' calls block parts directly: STREAM_LOSS / "
+            "CONCENTRATION_LOSS need whole-block forwards (CHECKPOINT 'block', "
+            "'partial:...' or 'none')"
+        )
+    host_masters = plan.optim_state != "gpu" or plan.stream == "swap"
+    if k.get("WD_TARGET", "zero") == "start" and host_masters:
+        p.append(
+            "WD_TARGET='start' decays device-stepped weights: optim_state 'gpu' and no "
+            f"stream='swap' (plan: optim_state={plan.optim_state!r}, "
+            f"stream={plan.stream!r})"
+        )
+    if outlier_spec(k) is not None and host_masters:
+        p.append(
+            "OUTLIER_DECAY decays device-stepped weights: optim_state 'gpu' and no "
+            f"stream='swap' (plan: optim_state={plan.optim_state!r}, "
+            f"stream={plan.stream!r})"
+        )
     if plan.checkpoint == "sub-block" and plan.compile == "block":
         p.append(
             "checkpoint='sub-block' calls block parts directly: not with "
@@ -313,9 +377,9 @@ def _layout(k: dict):
         return None
 
 
-def step_state(k: dict) -> bool:
+def has_step_state(k: dict) -> bool:
     """The run's adapters carry per-micro-batch step state (full FT carries none)."""
-    return not is_full(k) and config_from_knobs(k).step_state
+    return not is_full(k) and config_from_knobs(k).has_step_state
 
 
 def _plans(k: dict) -> tuple[list, list[str]]:
@@ -360,11 +424,28 @@ def _memory_problems(k: dict) -> list[str]:
     return p
 
 
+def deprecations(k: dict) -> list[str]:
+    """The deprecated knob values `k` sets (they still run, as the message says)."""
+    if k.get("DRIVER", "native") == "lightning":
+        return ["DRIVER='lightning' is deprecated: every run uses the native loop"]
+    return []
+
+
+def knob_warnings(k: dict) -> list[str]:
+    """The knob combinations that run but are logged: deprecated values, and fp16
+    compute on an unfixed DiT or teacher; PRECISION="auto" is resolved first."""
+    k = with_precision(k)
+    return deprecations(k) + objective_warnings(k) + distill_warnings(k)
+
+
 def check(g: dict) -> dict:
-    """Knobs from globals (PRECISION resolved); raises one SystemExit listing every
-    problem."""
-    k = with_precision(collect(g))
+    """Knobs from globals (PRECISION resolved, a set EXPORT_FORMATS mapped onto
+    SAVE_FORMAT / SAVE_MERGED); raises one SystemExit listing every problem and logs
+    every warning."""
+    k = with_export_formats(with_precision(collect(g)))
     problems = validate(k)
     if problems:
         raise SystemExit("invalid configuration:\n  - " + "\n  - ".join(problems))
+    for message in knob_warnings(k):
+        log.warning(message)
     return k

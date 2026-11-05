@@ -1,22 +1,23 @@
 """Between-step allocator release and accounting (CUDA / XPU): STEP_RELEASE "none"
-(default) returns no memory to the driver inside the training loop; "empty_cache"
-returns the free cached blocks after every optimizer step and an integer N after every
-N steps (explicit opt-ins: a release synchronises and blocks); the step metrics report
-what the allocator returned. See docs/internals/offload.md#between-step-release."""
+(default) keeps the allocator's cached blocks; "empty_cache" returns the free cached
+blocks after every optimizer step and an integer N after every N steps; the step
+metrics report what the allocator returned. See
+docs/internals/offload.md#between-step-release."""
 
 import time
+from functools import partial
 
 import torch
 
+from kohakumoss_common.units import GIB
 from kohakumoss_kernels.hardware.memory import reserved, trim
 
-GIB = 2**30
 DEFAULT = "none"
 RELEASE_NAMES = {"none": 0, "empty_cache": 1}
 
 
 def release_every(value) -> int:
-    """STEP_RELEASE as a step period: 0 (never) for "none", 1 for "empty_cache", N for
+    """STEP_RELEASE as a step period: 0 for "none", 1 for "empty_cache", N for
     an integer N >= 1."""
     if isinstance(value, str):
         return RELEASE_NAMES[value]
@@ -37,19 +38,20 @@ def release_problems(value) -> list[str]:
 
 class StepRelease:
     """Every `every` steps, after the optimizer step: the device's free cached blocks
-    go back to the driver (`release(device)`, a synchronise + empty_cache); keeps what
-    its last release returned (`released` bytes, host seconds)."""
+    go back to the driver (`empty(device)`, default `trim`: a synchronise +
+    empty_cache); keeps what its last release returned (`released` bytes, host
+    seconds)."""
 
-    def __init__(self, device, every: int, release=trim, clock=time.perf_counter):
+    def __init__(self, device, every: int, empty=trim, clock=time.perf_counter):
         self.device = torch.device(device)
         self.every = every
-        self.release = release
+        self.empty = empty
         self.clock = clock
         self.released, self.secs = 0, 0.0
 
     def on_step_end(self, state, out) -> None:
         began, before = self.clock(), reserved(self.device)
-        self.release(self.device)
+        self.empty(self.device)
         self.released = max(before - reserved(self.device), 0)
         self.secs = self.clock() - began
 
@@ -58,6 +60,10 @@ class StepRelease:
         out = self.released, self.secs
         self.released, self.secs = 0, 0.0
         return out
+
+
+def _take_from(source: StepRelease, stats) -> tuple[int, float]:
+    return source.take()
 
 
 class CacheReleaseStats:
@@ -75,7 +81,9 @@ class CacheReleaseStats:
         self.device = torch.device(device)
         self.rows = max(int(rows), 1)
         self.mark = reserved(self.device)
-        self.take = self._drop if source is None else source.take
+        self._take = (
+            CacheReleaseStats._drop if source is None else partial(_take_from, source)
+        )
         self.first = True
         self._clear()
 
@@ -88,7 +96,7 @@ class CacheReleaseStats:
         return freed, 0.0
 
     def on_step_end(self, state, out) -> None:
-        freed, secs = self.take()
+        freed, secs = self._take(self)
         self.count += freed > 0
         self.secs += secs
         self.steps += 1
@@ -102,14 +110,16 @@ class CacheReleaseStats:
             self._clear()
 
 
-def release_callbacks(device, rows: int, release=DEFAULT) -> list:
+def release_callbacks(device, rows: int, release=DEFAULT, stats: bool = True) -> list:
     """On an accelerator: the STEP_RELEASE callback (resolved once; none for "none")
     ahead of the accounting of what the allocator returned (metric rows every `rows`
-    steps); nothing on the host."""
+    steps; `stats` False leaves the accounting out); nothing on the host."""
     device = torch.device(device)
     if device.type not in ("cuda", "xpu"):
         return []
     every = release_every(release)
     releasing = [StepRelease(device, every)] if every else []
+    if not stats:
+        return releasing
     source = releasing[0] if releasing else None
     return releasing + [CacheReleaseStats(device, rows, source)]

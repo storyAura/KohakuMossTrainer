@@ -12,6 +12,7 @@ from torch import Tensor, nn
 from kohakumoss.memory.runners import PlainRunner
 from kohakumoss.types.context import BlockCtx
 from kohakumoss.types.seqinfo import SeqInfo
+from kohakumoss_common.calls import nothing
 
 
 def ctx_to(ctx: BlockCtx, device: torch.device) -> BlockCtx:
@@ -27,10 +28,6 @@ def ctx_to(ctx: BlockCtx, device: torch.device) -> BlockCtx:
             case _:
                 moved[f.name] = value
     return replace(ctx, **moved)
-
-
-def _no_install(state) -> None:
-    return None
 
 
 def even_bounds(n: int, k: int) -> list[tuple[int, int]]:
@@ -58,7 +55,7 @@ class ThreadedPipeline:
         schedule: str = "gpipe",
     ):
         self.model = model
-        self.install: Callable = _no_install
+        self.install: Callable = nothing
         self.devices = [torch.device(d) for d in devices]
         self.bounds = bounds or even_bounds(len(model.layers), len(self.devices))
         if len(self.bounds) != len(self.devices):
@@ -85,9 +82,9 @@ class ThreadedPipeline:
         self._rest = tuple(stages[1:])
         match schedule:
             case "gpipe":
-                self._step = self._gpipe
+                self._step = ThreadedPipeline._gpipe
             case "async":
-                self._step = self._async
+                self._step = ThreadedPipeline._async
             case _:
                 raise ValueError(f"threaded schedule {schedule!r} not in gpipe|async")
 
@@ -114,7 +111,7 @@ class ThreadedPipeline:
         `states[k]` is micro-batch k's adapter step state (None: nothing to install).
         """
         states = list(states) if states is not None else [None] * len(microbatches)
-        return self._step(microbatches, loss_fn, states)
+        return self._step(self, microbatches, loss_fn, states)
 
     def _gpipe(self, microbatches, loss_fn, states) -> Tensor:
         losses = []

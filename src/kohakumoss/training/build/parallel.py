@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from kohakumoss.diffusion.objective import all_reduce_sum, identity_reduce
+from kohakumoss.diffusion.objective import all_reduce_sum
 from kohakumoss.parallel.ddp import (
     AsyncReducer,
     GradReducer,
@@ -23,18 +23,19 @@ from kohakumoss.training.optim.bundle.base import (
     all_reduce_max,
     all_reduce_norm,
     local_grad_norm,
-    no_agree,
 )
+from kohakumoss_common.calls import identity
+from kohakumoss_common.units import MIB
 
 
 @dataclass
 class ParallelHooks:
     """What the loop needs from the parallel layout (single-device defaults)."""
 
-    reduce: Callable = identity_reduce
+    reduce: Callable = identity
     world_factor: int = 1
-    agree: Callable = no_agree
-    reduce_loss: Callable = no_agree
+    agree: Callable = identity
+    reduce_loss: Callable = identity
     grad_norm: Callable = local_grad_norm
     accumulate: Callable = no_accumulate
     before: Callable = lambda: None
@@ -44,12 +45,13 @@ class ParallelHooks:
     forward: object = None
 
 
-REDUCE_DTYPES = {"fp32": torch.float32, "param": None}
+REDUCE_DTYPES = {"fp32": torch.float32, "param": None, "bf16": torch.bfloat16}
 DDP_BACKENDS = ("kohakumoss", "torch")
 
 
 def reduce_dtype(name: str) -> torch.dtype | None:
-    """DDP_REDUCE_DTYPE: 'fp32' sums every gradient in fp32, 'param' in its own dtype."""
+    """DDP_REDUCE_DTYPE: 'fp32' sums every gradient in fp32, 'param' in its own dtype,
+    'bf16' in bf16 (half the bytes of fp32 gradients on the wire)."""
     if name not in REDUCE_DTYPES:
         raise ValueError(f"DDP_REDUCE_DTYPE={name!r} not in {tuple(REDUCE_DTYPES)}")
     return REDUCE_DTYPES[name]
@@ -78,14 +80,17 @@ class _Started:
         return contextlib.nullcontext()
 
 
-def ddp_hooks(built, device: torch.device, reduce: str = "fp32") -> ParallelHooks:
+def ddp_hooks(
+    built, device: torch.device, reduce: str = "fp32", bucket_mb: int = 25
+) -> ParallelHooks:
     """SUM reduce of every trainable gradient on the last micro-batch (in fp32, or the
     parameters' dtype: DDP_REDUCE_DTYPE): device gradients in place in GradReducer
-    buckets when the plan keeps them until the step, otherwise through the
-    AsyncReducer (`ddp`) that the memory wiring hands them to (in-backward steps,
-    gradient offload, streamed blocks). Rank 0's trainable device parameters are
-    broadcast; streamed masters are one shared host copy already."""
+    buckets of `bucket_mb` MiB (DDP_BUCKET_MB) when the plan keeps them until the step,
+    otherwise through the AsyncReducer (`ddp`) that the memory wiring hands them to
+    (in-backward steps, gradient offload, streamed blocks). Rank 0's trainable device
+    parameters are broadcast; streamed masters are one shared host copy already."""
     dtype = reduce_dtype(reduce)
+    size = bucket_mb * MIB
     params = list(built.trainable.trainable_params())
     host = {id(p) for p in built.engines.host_params()}
     local = [p for p in params if id(p) not in host]
@@ -93,11 +98,11 @@ def ddp_hooks(built, device: torch.device, reduce: str = "fp32") -> ParallelHook
     plan = built.plan
     plain = not (plan.fused_step or plan.grad_offload)
     inner = (
-        GradReducer(local, average=False, reduce_dtype=dtype)
+        GradReducer(local, bucket_bytes=size, average=False, reduce_dtype=dtype)
         if plain and local
         else None
     )
-    reducer = AsyncReducer(device, inner=inner, reduce_dtype=dtype)
+    reducer = AsyncReducer(device, bucket_bytes=size, inner=inner, reduce_dtype=dtype)
     return ParallelHooks(
         reduce=all_reduce_sum,
         world_factor=1,
@@ -164,11 +169,31 @@ def fsdp_accumulate(backbone, reduce: str) -> Callable:
     raise ValueError(f"FSDP_REDUCE={reduce!r} not in ('step', 'micro')")
 
 
-def fsdp_hooks(backbone, world: int, reduce: str = "step") -> ParallelHooks:
+def reshard_after_forward(reshard: str) -> bool:
+    """FSDP_RESHARD: 'forward' frees each block's gathered parameters after its forward
+    and gathers them again in backward (ZeRO-3); 'backward' holds them from the forward
+    gather through backward (ZeRO-2: one gather per micro-batch)."""
+    match reshard:
+        case "forward":
+            return True
+        case "backward":
+            return False
+    raise ValueError(f"FSDP_RESHARD={reshard!r} not in ('forward', 'backward')")
+
+
+def fsdp_hooks(
+    backbone, world: int, reduce: str = "step", reshard: str = "forward"
+) -> ParallelHooks:
     """Shard each conditioning linear, text-refiner and joint block, then the backbone
     (parameters in their own dtype, FSDP2 SUM of fp32 gradients); gradient sync per
-    FSDP_REDUCE (`fsdp_accumulate`)."""
-    shard(backbone, block_units(backbone), conditioning_units(backbone))
+    FSDP_REDUCE (`fsdp_accumulate`), block resharding per FSDP_RESHARD
+    (`reshard_after_forward`)."""
+    shard(
+        backbone,
+        block_units(backbone),
+        conditioning_units(backbone),
+        reshard_after_forward=reshard_after_forward(reshard),
+    )
     return ParallelHooks(
         reduce=all_reduce_sum,
         world_factor=1,

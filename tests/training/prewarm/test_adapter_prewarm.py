@@ -92,7 +92,12 @@ def test_prewarm_hands_the_planned_buckets_to_the_trainable_set():
 def timing(tmp_path, monkeypatch):
     monkeypatch.setenv("KOHAKUMOSS_KERNEL_CACHE", str(tmp_path))
     monkeypatch.setattr(tuner, "_TABLES", {})
-    monkeypatch.setattr(tuner, "TIMINGS", {"events": lambda fn, dev: (fn(), 1.0)[1]})
+
+    def unit(fn, dev):
+        fn()
+        return 1.0
+
+    monkeypatch.setattr(tuner, "TIMINGS", {"events": unit, "burst": unit})
     tuner.reset()
     tuner.set_mode("table")
     yield
@@ -197,9 +202,12 @@ def check_inherits(fake, monkeypatch, budget, predict: bool = True) -> None:
     seen, clock = [], {"ms": 1.0}
     op = _with_base_op()
     op.candidates = {impl: _using(fake, impl, seen, clock) for impl in op.candidates}
-    monkeypatch.setattr(
-        tuner, "TIMINGS", {"events": lambda fn, d: (fn(), clock["ms"])[1]}
-    )
+
+    def clocked(fn, d):
+        fn()
+        return clock["ms"]
+
+    monkeypatch.setattr(tuner, "TIMINGS", {"events": clocked, "burst": clocked})
     if not predict:
         monkeypatch.setattr(autotuned.AutotunedOp, "_over", lambda *a: False)
     fake.top = 0
@@ -369,7 +377,7 @@ def _cap_only(budgets):
 
 @pytest.mark.cpu
 def test_prewarm_end_caps_every_later_tune():
-    check_capped_after_prewarm(prewarm.go_capped)
+    check_capped_after_prewarm(prewarm.end_prewarm)
     must_fail(lambda: check_capped_after_prewarm(_cap_only), "LyCORIS left tuning")
 
 

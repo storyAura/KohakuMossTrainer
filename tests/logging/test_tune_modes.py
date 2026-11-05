@@ -22,8 +22,8 @@ from kohakumoss.model.opset import OpSet
 from kohakumoss.training.build import kernels as train_kernels
 from kohakumoss.training.callbacks import kernels as step_kernels
 from kohakumoss_kernels.backends.compile.choice import retune_pending
-from kohakumoss_kernels.backends.compile.prewarm import prewarm_block_ops
 from kohakumoss_kernels.tuning import tuner
+from tests._util.blockops_prewarm import prewarm_block_ops
 from tests._util.logs import assert_phases
 from tests._util.negative import must_fail
 from tests.training.knobs.test_knobs import runnable
@@ -165,9 +165,8 @@ def test_prewarm_log_lines(collect):
 def test_startup_speed_line(collect):
     ticks = iter([0.0, 5.0, 6.0, 7.0, 8.0])
     speed = step_kernels.StartupSpeed(last=4, clock=lambda: next(ticks))
-    for _ in range(4):
-        speed.on_step_end(None, None)
+    done = [speed.on_step_end(None, None) for _ in range(4)]
     expected = "step 1 5.000 s/step, steps 2-4 median 1.000 s/step (5.0x)"
     assert expected in collect.messages, collect.messages
-    speed.on_step_end(None, None)
+    assert done == [False, False, False, True]
     assert collect.messages.count(expected) == 1

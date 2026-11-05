@@ -15,11 +15,12 @@ from typing import Annotated
 import torch
 from kohakuengine import FormatArg
 
-from kohakumoss.encoders.vae import resolve_vae_dtype
+from kohakumoss.encoders.vae import resolve_vae_dtype, vae_dtype_problems
 from kohakumoss.inference import MossPipeline, grid, knobs
 from kohakumoss.inference.placement_report import forward_tokens
 from kohakumoss.logging.log import get_logger, hl, setup
-from kohakumoss.model.numerics import fix_problems
+from kohakumoss.memory.knob_map import mixing_problems, primary_names
+from kohakumoss.model.numerics import fix_problems, fix_warnings
 from kohakumoss_common.knobs import check_script, choice_problems, prompt_list
 
 log = get_logger("scripts.compare_grid")
@@ -28,11 +29,11 @@ GRID_CHOICES = ("VARIANT", "PRECISION", "MEMORY_PROFILE", "BASE_PRECISION", "FP1
 GRID_CHOICES += ("ADAPTER_MODE", "CFG_MODE", "TUNE")
 
 # ===================== MODEL =====================
-WEIGHTS = ""  # weights root (base/, sft/) or one pipeline dir
-VARIANT = (
-    "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists
-)
-TRANSFORMER = ""  # DiT override (file / dir); "" = WEIGHTS
+WEIGHTS = ""  # ComfyUI models folder | HF weights root (base/, sft/) | one pipeline dir
+VARIANT = "base"  # "base" | "sft": the arch preset; WEIGHTS/<VARIANT> is read when it exists (ComfyUI: the DiT file)
+TRANSFORMER = ""  # DiT override (file / dir; ComfyUI folder: a file name); "" = WEIGHTS
+TEXT_ENCODER = ""  # text encoder as in sample.py ("" = WEIGHTS' own)
+VAE = ""  # VAE as in sample.py ("" = WEIGHTS' own)
 CHECKPOINTS = (
     []
 )  # adapter files, one grid line each after the base: path or (path, multiplier)
@@ -42,7 +43,7 @@ ADAPTER_MODE = "bypass"  # "bypass" | "merge" (both undone between columns)
 PRECISION = "bf16"  # compute dtype: "bf16" | "fp16" | "fp32" | "auto"
 FP16_FIX = "none"  # "none" | "online" | "fp32_residual"
 FP16_FIX_KWARGS = {}  # e.g. {"c": 0.0625}
-TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored; no prewarm)
+TUNE = "off"  # "off" (stored per-card decisions, else fixed defaults; nothing timed) | "table" (missing decisions also tuned on first use, then stored)
 
 # ===================== DEVICES =====================
 DEVICE = "cuda"
@@ -51,12 +52,10 @@ TEXT_ENCODE = (
     {}
 )  # TextEncoderPlan fields as in sample.py ("free_after_use": True frees it after the one encode)
 VAE_ENCODE = {}  # VaePlan fields as in sample.py
-VAE_DTYPE = "auto"  # "auto" (bf16, fp16 without bf16) | "bf16" | "fp16" | "fp32"
+VAE_DTYPE = "auto"  # "auto" (bf16, fp16 on fp16-only GPUs) | "bf16" | "fp16" | "fp32"
 MEMORY_PROFILE = ""  # DiT memory profile: "" (resident) | a catalog profile | "speed" | "balanced" | "low" | "minimal" | "manual" | "auto" (the fastest that fits)
 MEMORY_OVERRIDES = {}  # MemoryPlan fields
-BASE_PRECISION = (
-    "compute"  # DiT base: "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"
-)
+BASE_PRECISION = "auto"  # DiT base: "auto" (what the file stores) | "compute" | "int8" | "fp8" | "fp8_compute" | "mxfp8"
 FP8_RECIPE = "row"  # fp8_compute scaling: "tensor" | "row" | "block"
 # MEMORY_PROFILE="manual": the DiT placement, as in sample.py (None = the default).
 STREAM = None  # "off" (resident) | "ring" (block weights streamed through device slots)
@@ -117,33 +116,46 @@ def problems(k: dict) -> list[str]:
         for c, _ in checkpoints_of(k)
         if not Path(c).exists()
     ]
+    p += fix_problems(k["FP16_FIX"], k["FP16_FIX_KWARGS"])
+    p += choice_problems(k, {n: knobs.CHOICES[n] for n in GRID_CHOICES})
+    p += mixing_problems(
+        k, k["MEMORY_PROFILE"], "MEMORY_PROFILE", knobs.INFERENCE_KNOBS
+    )
+    if k["GRID_LAYOUT"] not in LAYOUTS:
+        p.append(f"GRID_LAYOUT={k['GRID_LAYOUT']!r} not in {tuple(LAYOUTS)}")
+    p += knobs.component_problems(k)
+    p += vae_dtype_problems(k["VAE_DTYPE"], k["DEVICE"])
+    return p + knobs.size_problems(k) + knobs.encoder_problems(k)
+
+
+def knob_warnings(k: dict) -> list[str]:
+    """The grid knob combinations that run but are logged."""
     valid = k["PRECISION"] in knobs.DTYPE_NAMES
     fp16 = valid and knobs.compute_dtype(k["PRECISION"], k["DEVICE"]) == torch.float16
-    p += fix_problems(
+    return fix_warnings(
         k["FP16_FIX"],
-        k["FP16_FIX_KWARGS"],
         fp16,
         knobs.carries_fix(k["TRANSFORMER"]),
         "PRECISION='fp16'",
         "TRANSFORMER",
     )
-    p += choice_problems(k, {n: knobs.CHOICES[n] for n in GRID_CHOICES})
-    if k["GRID_LAYOUT"] not in LAYOUTS:
-        p.append(f"GRID_LAYOUT={k['GRID_LAYOUT']!r} not in {tuple(LAYOUTS)}")
-    return p + knobs.size_problems(k) + knobs.encoder_problems(k)
 
 
 def main() -> None:
     setup()
-    k = check_script(globals(), knobs.RENAMED)
+    k = primary_names(check_script(globals(), knobs.RENAMED))
     found = problems(k)
     if found:
         raise SystemExit("invalid configuration:\n  - " + "\n  - ".join(found))
+    for message in knob_warnings(k):
+        log.warning(message)
     memory, overrides = knobs.memory_of(k)
     pipe = MossPipeline.from_pretrained(
         k["WEIGHTS"],
         variant=k["VARIANT"],
         transformer=k["TRANSFORMER"] or None,
+        text_encoder_file=k["TEXT_ENCODER"],
+        vae_file=k["VAE"],
         dtype=knobs.compute_dtype(k["PRECISION"], k["DEVICE"]),
         device=k["DEVICE"],
         text_device=k["TEXT_DEVICE"] or None,

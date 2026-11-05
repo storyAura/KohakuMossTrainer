@@ -7,11 +7,12 @@ import torch
 from torch import Tensor, nn
 
 from kohakumoss.offload.accel import module, streamed
+from kohakumoss.offload.host.arena import host_tensors
 
 RING_SLOTS = 3
 
 
-def ring_bytes(largest: int) -> int:
+def state_ring_bytes(largest: int) -> int:
     """Device bytes of HostStateAdamW's state ring: RING_SLOTS slots of 4 fp32 rows
     (master, m, v, gradient) of the largest parameter."""
     return RING_SLOTS * 4 * 4 * largest
@@ -127,8 +128,9 @@ class MasterAdamW(_GroupsMixin):
 
 
 class HostStateAdamW(_GroupsMixin):
-    """AdamW computed on the device with master / moments in (pinned) host memory,
-    streamed per parameter through a 3-slot device ring on side streams."""
+    """AdamW computed on the device with master / moments in (pinned) host memory, one
+    exact-size HostArena (`arena`), streamed per parameter through a 3-slot device ring
+    on side streams."""
 
     def __init__(
         self,
@@ -143,20 +145,20 @@ class HostStateAdamW(_GroupsMixin):
         self.host: dict[int, tuple] = {}
         largest = max((p.numel() for p in self.params), default=0)
         self.device = self.params[0].device if self.params else torch.device("cpu")
-        cuda = streamed(self.device)
-        self.cuda = cuda
+        side = streamed(self.device)
+        self.streamed = side
         self.dm = module(self.device)
-        pin = pinned and cuda
-        step_device = self.device if cuda else torch.device("cpu")
+        pin = pinned and side
+        step_device = self.device if side else torch.device("cpu")
         self.steps = {
             id(p): torch.zeros((), dtype=torch.float32, device=step_device)
             for p in self.params
         }
-        for p in self.params:
-            master = p.detach().float().cpu()
-            master = master.pin_memory() if pin else master.clone()
-            zeros = [torch.zeros(master.shape, pin_memory=pin) for _ in range(2)]
-            self.host[id(p)] = (master, *zeros)
+        specs = [(p.shape, torch.float32) for p in self.params for _ in range(3)]
+        fill = [t for p in self.params for t in (p.detach(), None, None)]
+        self.arena, states = host_tensors(specs, pin, self.device, fill)
+        for i, p in enumerate(self.params):
+            self.host[id(p)] = tuple(states[3 * i : 3 * i + 3])
         self.n_slots = RING_SLOTS
         # rows: master, m, v, the fp32 gradient
         self.slots = [
@@ -169,7 +171,7 @@ class HostStateAdamW(_GroupsMixin):
         self.after = {id(a): b for a, b in zip(order, order[1:])}
         self.last: Tensor | None = None
         self.stats = {"bytes_h2d": 0, "bytes_d2h": 0}
-        if cuda:
+        if side:
             self.h2d = self.dm.Stream(self.device)
             self.d2h = self.dm.Stream(self.device)
             self.opt = self.dm.Stream(self.device)
@@ -183,9 +185,9 @@ class HostStateAdamW(_GroupsMixin):
                 self.written[id(p)] = self.dm.Event()
                 self.written[id(p)].record(cur)
             self.no_inf = torch.zeros((), dtype=torch.float32, device=self.device)
-            self._update = self._update_device
+            self._update = HostStateAdamW._update_device
         else:
-            self._update = self._update_host
+            self._update = HostStateAdamW._update_host
 
     def _update_host(self, p: Tensor, ahead: Tensor | None, found_inf) -> None:
         master, m, v = self.host[id(p)]
@@ -252,7 +254,7 @@ class HostStateAdamW(_GroupsMixin):
 
     def finish(self) -> None:
         """The compute stream waits for every in-flight update (before the next forward)."""
-        if self.cuda:
+        if self.streamed:
             self.dm.current_stream(self.device).wait_stream(self.opt)
         self.loaded.clear()
         self.last = None
@@ -263,18 +265,18 @@ class HostStateAdamW(_GroupsMixin):
         if self.last is not None:
             self.after[id(self.last)] = p
         self.last = p
-        self._update(p, self.after.get(id(p)), found_inf)
+        self._update(self, p, self.after.get(id(p)), found_inf)
 
     @torch.no_grad()
     def step(self) -> None:
         live = [p for p in self.params if p.grad is not None]
         for p, ahead in zip(live, live[1:] + [None]):
-            self._update(p, ahead, None)
+            self._update(self, p, ahead, None)
         self.finish()
 
     def synchronize(self) -> None:
         """Wait until every state write-back has landed on the host."""
-        if self.cuda:
+        if self.streamed:
             self.d2h.synchronize()
 
     def state_dict(self) -> dict:

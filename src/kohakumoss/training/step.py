@@ -4,6 +4,7 @@ An online cache hit arrives with `latents` / `text` set and is used as is; a mis
 arrives with `pixels` / `prompts` and is encoded.
 """
 
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -235,6 +236,11 @@ class TrainStep:
     step; `denominator(batch)` gives the one of a lone batch (validation, tests). The
     sigma and noise generators are seeded from `(seed, rank)`. `keep(prepared, denom)`
     sees every prepared micro-batch (the non-finite recorder's last one).
+
+    The training step's loss is `hard_weight` x the data loss, plus with a `teacher`
+    (prepared batch -> its velocity, no grad) `distill_weight` x the same token loss
+    against the teacher's velocity under `distill_weighting`, plus the stream
+    `penalty`.
     """
 
     def __init__(
@@ -251,7 +257,22 @@ class TrainStep:
         pre_forward: Callable | None = None,
         rank: int = 0,
         keep: Callable | None = None,
+        penalty=None,
+        probe=None,
+        teacher: Callable | None = None,
+        hard_weight: float = 1.0,
+        distill_weight: float = 0.0,
+        distill_weighting: Callable | None = None,
     ):
+        self.penalty = penalty
+        self.probe = probe
+        self.teacher = teacher
+        self.hard_weight = float(hard_weight)
+        self.distill_weight = float(distill_weight)
+        self.distill_weighting = distill_weighting or weighting
+        self.composite = (
+            penalty is not None or teacher is not None or self.hard_weight != 1.0
+        )
         self.pre_forward = pre_forward or nothing
         self.keep = keep or nothing
         self.backbone = backbone
@@ -301,9 +322,55 @@ class TrainStep:
     def __call__(self, batch: DeviceBatch, denom: Tensor, step: int = 0) -> StepOut:
         p = self.prepare(batch, step)
         self.keep(p, denom)
+        if self.composite:
+            return self._composite(batch, p, denom, step)
         with self.autocast():
             pred = self.backbone(p.z, p.text, p.sigma, p.seq)
         return StepOut(self.loss(pred, p, denom), denom, {"sigma_mean": p.sigma.mean()})
+
+    def _composite(
+        self, batch: DeviceBatch, p: Prepared, denom: Tensor, step: int
+    ) -> StepOut:
+        """hard x data loss + distill x teacher loss + the stream penalty, the penalty
+        weighted by this micro-batch's share of the step's loss tokens (the step total
+        is the token-weighted mean); `loss_task` / `loss_distill` are this
+        micro-batch's own means. On probe steps, the per-term gradient metrics
+        (STREAM_LOSS_PROBE)."""
+        collect = (
+            self.penalty.collecting()
+            if self.penalty is not None
+            else contextlib.nullcontext()
+        )
+        with collect, self.autocast():
+            pred = self.backbone(p.z, p.text, p.sigma, p.seq)
+        share = self.count_of(batch) / denom
+        task = self.loss(pred, p, denom)
+        loss = task * self.hard_weight
+        probed = {"task": task}
+        parts = {"sigma_mean": p.sigma.mean(), "loss_task": (task / share).detach()}
+        if self.teacher is not None:
+            distill = self.distill_loss(pred, batch, p, denom)
+            loss = loss + distill * self.distill_weight
+            probed["distill"] = distill
+            parts["loss_distill"] = (distill / share).detach()
+        if self.penalty is not None:
+            penalty, stream, terms = self.penalty.take(p, step)
+            loss = loss + penalty * share
+            probed.update({name: value * share for name, value in terms.items()})
+            parts.update(stream)
+        if self.probe is not None and self.probe.due(step):
+            parts.update(self.probe.measure(probed))
+        return StepOut(loss, denom, parts)
+
+    def distill_loss(
+        self, pred: Tensor, batch: DeviceBatch, p: Prepared, denom: Tensor
+    ) -> Tensor:
+        """Token loss of `pred` against the teacher's velocity at the same inputs, per
+        sample weighted by `distill_weighting`, over the step's denominator."""
+        target = self.teacher(p).to(pred.dtype)
+        weight = self.distill_weighting(p.sigma, batch.weight.float())
+        loss_sum = self.loss_fn(pred, target, p.seq.seg_img, weight, p.mask)
+        return self.normalizer(loss_sum, denom)
 
     def rng_state(self) -> dict:
         return {

@@ -1,6 +1,6 @@
 # Example training run: a short LoRA / LoKr run on your dataset, from a generated config.
 #
-#   .\scripts\examples\train.ps1 -Weights models\MOSS-Image-Base -Dataset D:\data\my_set
+#   .\scripts\examples\train.ps1 -Weights ComfyUI\models -Dataset D:\data\my_set
 #   .\scripts\examples\train.ps1 -Algo lokr -Precision fp16 -BasePrecision int8 -Memory minimal
 #   .\scripts\examples\train.ps1 -Steps 30 -SampleEvery 10        # quick run with sample images
 #   .\scripts\examples\train.ps1 -Device xpu -Index 1              # second Intel Arc GPU
@@ -19,7 +19,7 @@ param(
     [ValidateSet("cuda", "xpu")] [string] $Device = "cuda",
     # GPU index within that kind: cuda -> CUDA_VISIBLE_DEVICES (nvidia-smi order), xpu -> ZE_AFFINITY_MASK.
     [int] $Index = 0,
-    # Weights root (HF layout: transformer\, text_encoder\, vae\).
+    # Weights: a ComfyUI models folder (diffusion_models\, text_encoders\, vae\) or an HF folder (transformer\, text_encoder\, vae\).
     [string] $Weights = $env:KOHAKUMOSS_WEIGHTS,
     # The fp16-fix checkpoint, used with -FixFile (single-file transformer with the fold in its metadata).
     [string] $FixCheckpoint = "",
@@ -41,16 +41,17 @@ param(
     [ValidateSet("bf16", "fp16")] [string] $Precision = "bf16",
     # fp16 from the fp16-fix checkpoint instead of the online fix (text encoder / VAE still from -Weights).
     [switch] $FixFile,
-    # DiT base: compute = bf16 / fp16; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
-    [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "compute",
-    # Memory profile (weights stay at -BasePrecision; no profile quantizes). Any catalog name, built
+    # DiT base: auto = what the DiT file stores (the ComfyUI int8 file: int8); compute = bf16 / fp16; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
+    [ValidateSet("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "auto",
+    # Memory profile (weights stay at -BasePrecision). Any catalog name, built
     # from its parts in this order (omit a part for its default):
     #   checkpoint: nockpt | ckpt | subckpt
-    #   weights:    resident | stream16 | stream8 | stream4 | stream2   (blocks kept on the GPU)
+    #   weights:    resident | ring16 | ring8 | ring4 | ring2   (blocks kept on the GPU)
     #   activations: actoff                                             (offload saved activations)
     #   optimizer:  optfused | optstream | optcpu                        (default: GPU AdamW)
     #   gradients:  gradoff                                             (offload gradients)
-    #   e.g. ckpt-stream8, nockpt-resident-optcpu, ckpt-stream2-actoff-optstream-gradoff
+    #   e.g. ckpt-ring8, nockpt-resident-optcpu, ckpt-ring2-actoff-optstream-gradoff
+    #   (the older spellings stream16 .. stream2 are accepted too)
     # Short names: speed, balanced, low, minimal; auto = the fastest whose estimate fits the GPU.
     # Full list: kohakumoss-config list. "manual" = no profile: the plan comes from -Checkpoint ...
     # -FusedStep below (unset ones take their default).
@@ -80,8 +81,8 @@ param(
     [int] $TargetArea = 1048576,
     # Joint (image + text) tokens per packed batch.
     [int] $MaxTokens = 8192,
-    # Text encoder during training: auto (fastest that fits) | stream (layers from host RAM) | offload | resident.
-    [ValidateSet("auto", "stream", "offload", "resident")] [string] $TextMemory = "auto",
+    # Text encoder during training: auto (fastest that fits) | ring (layers from host RAM; "stream" is accepted too) | offload | resident.
+    [ValidateSet("auto", "ring", "stream", "offload", "resident")] [string] $TextMemory = "auto",
     # Caches: off = no cache, the VAE and text encoder encode every batch in the loop and nothing is
     # written | online = encode on a miss and write latents / text embeddings to the cache dir on disk
     # (later runs read them back) | offline = read a prebuilt cache only.
@@ -106,9 +107,9 @@ param(
     [int] $Seed = 0,
     # Full log line (and logger sinks) every N steps; between them the progress bar shows loss / lr / speed / VRAM.
     [int] $LogEvery = 10,
-    # Metrics sink: console | board (KohakuBoard) | wandb (needs `wandb login` once).
-    [ValidateSet("console", "board", "wandb")] [string] $Logger = "console",
-    # Project name for board / wandb.
+    # Metrics sink: console | wandb (needs `wandb login` once).
+    [ValidateSet("console", "wandb")] [string] $Logger = "console",
+    # Project name for wandb.
     [string] $Project = "kohakumoss",
     # Output root (relative paths are under the current directory).
     [string] $Out = "runs\examples\train",
@@ -208,7 +209,7 @@ try {
         "use_config($(PyPath (Join-Path $cfgRoot 'algo\algo_lora.py')))`nDIM = $Dim`nALPHA = float($Dim)"
     }
     $precisionLines = if ($Precision -eq "fp16" -and $FixFile) {
-        "PRECISION = 'fp16'`nFP16_FIX = 'none'`nWEIGHTS = $(PyPath (FullPath $FixCheckpoint))`nTEXT_ENCODER = $(PyPath (Join-Path $Weights 'text_encoder'))`nVAE = $(PyPath (Join-Path $Weights 'vae'))"
+        "PRECISION = 'fp16'`nFP16_FIX = 'none'`nWEIGHTS = $(PyPath $Weights)`nTRANSFORMER = $(PyPath (FullPath $FixCheckpoint))"
     } elseif ($Precision -eq "fp16") {
         "use_config($(PyPath (Join-Path $cfgRoot 'precision\precision_fp16.py')))`nWEIGHTS = $(PyPath $Weights)"
     } else {

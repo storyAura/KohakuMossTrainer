@@ -8,8 +8,9 @@ from torch import Tensor, nn
 from kohakumoss.memory.apply import MemoryEngines, apply_to_backbone
 from kohakumoss.offload.optim.cpu_optim import CPUAdamW
 from kohakumoss.offload.optim.gpu_adamw import HostStateAdamW, MasterAdamW
-from kohakumoss.training.memory.optimizers import build_memory_optim, host_optimizer
+from kohakumoss.training.memory.optimizers import build_memory_optim, device_optimizer
 from kohakumoss.types.plans import MemoryPlan, PrecisionConfig
+from kohakumoss_kernels.registry import settle_guards
 
 CONSTANT = {"mode": "constant"}
 
@@ -77,7 +78,7 @@ class MemorySession:
     @property
     def dev_opt(self):
         """The optimiser of the device (non-streamed) parameters."""
-        return host_optimizer(self.bundle)
+        return device_optimizer(self.bundle)
 
     @property
     def block_opt(self):
@@ -93,7 +94,11 @@ class MemorySession:
             self.bundle.backward(loss)
 
     def step(self) -> bool:
-        return self.bundle.step()
+        """The optimiser step; the kernels proven in this step bind their plain call
+        path (`settle_guards`)."""
+        ok = self.bundle.step()
+        settle_guards()
+        return ok
 
     def masters(self, model: nn.Module) -> dict[str, Tensor]:
         """fp32 masters of every trainable parameter by name (for checks / checkpoints)."""

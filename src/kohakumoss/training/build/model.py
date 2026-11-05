@@ -1,7 +1,6 @@
 """Model-side build: backbone, fold, memory plan, trainable set, encoders, export."""
 
 import contextlib
-import os
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -13,28 +12,34 @@ from kohakumoss.adapters.build.config import config_from_knobs
 from kohakumoss.adapters.build.presets import frozen_blocks
 from kohakumoss.encoders.specs import cache_specs
 from kohakumoss.encoders.text import QwenTextEncoder, text_plan
-from kohakumoss.encoders.text.encoder import default_auto_memory
+from kohakumoss.encoders.text.encoder import (
+    default_auto_memory,
+    default_w4a8,
+    resolve_text_plan,
+)
 from kohakumoss.encoders.text.plan import DTYPES as TEXT_DTYPES
-from kohakumoss.encoders.text.plan import resolve_dtype
+from kohakumoss.encoders.text.plan import MEMORY_ALIASES as TEXT_MEMORY_ALIASES
 from kohakumoss.encoders.vae import FluxVae, resolve_vae_dtype
 from kohakumoss.logging.log import get_logger, hl
-from kohakumoss.memory.apply import apply_to_backbone
+from kohakumoss.memory.apply import apply_to_backbone, quantized_weights
 from kohakumoss.memory.estimate import Workload, estimate
 from kohakumoss.memory.planner import NothingFits, auto_plan
 from kohakumoss.memory.profiles import ORDER, catalog_name
 from kohakumoss.memory.profiles import resolve as resolve_profile
 from kohakumoss.model import load_backbone, resolve_config
-from kohakumoss.model.numerics import output_row_scales
 from kohakumoss.model.numerics.fp16fix import apply_fp16_fix
 from kohakumoss.model.opset import OpSet
 from kohakumoss.offload.accel import module as accel_module
-from kohakumoss.offload.accel import streamed
+from kohakumoss.offload.accel import streamed, with_index
 from kohakumoss.offload.encoders.report import encoder_lines
+from kohakumoss.offload.encoders.vae import MEMORY_ALIASES as VAE_MEMORY_ALIASES
 from kohakumoss.offload.encoders.vae import place_vae
 from kohakumoss.parallel.launch import dist_rank, gate_name, rank0_value
 from kohakumoss.precision import apply_param_dtypes
 from kohakumoss.training.build.text_estimate import pass_tokens, planned_text_sizes
+from kohakumoss.training.distill import build_teacher
 from kohakumoss.training.ema.averagers import decay_count
+from kohakumoss.training.exports import export_files, fused_qkv, write_exports
 from kohakumoss.training.full import FullTrainable
 from kohakumoss.training.knobs import (
     is_full,
@@ -44,7 +49,10 @@ from kohakumoss.training.knobs import (
 )
 from kohakumoss.training.optim.groups import last_block_qk_norm
 from kohakumoss.training.optim.optimizers.factory import STATE_BYTES
+from kohakumoss.training.weights import component, stored_dit_precision
 from kohakumoss.types.plans import PrecisionConfig
+from kohakumoss.weights import DIT, TEXT, VAE
+from kohakumoss_common.hostmem import trim_heap
 from kohakumoss_kernels.hardware.current import rng_kept
 
 log = get_logger(__name__)
@@ -59,18 +67,23 @@ class Built:
     vae: object | None
     text_encoder: object | None
     sample_embeds: list | None = None
+    feed: object | None = None
+    teacher: object | None = None
 
 
-def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig):
-    """The backbone loaded from WEIGHTS."""
+def build_backbone(k: dict, device: torch.device, prec: PrecisionConfig, defer=None):
+    """The backbone loaded from WEIGHTS (TRANSFORMER: the ComfyUI folder's file); the
+    weights `defer(meta model)` names stay unread for the quantizer
+    (`load_backbone`)."""
     cfg = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
     model, _ = load_backbone(
-        k["WEIGHTS"],
+        component(k, DIT),
         device=device,
         dtype=prec.compute,
         keep_fp32=prec.keep_fp32,
         cfg=cfg,
         kernels=k["KERNELS"],
+        defer=defer,
     )
     return model
 
@@ -101,9 +114,11 @@ def workload(
         world=world,
         sharded=k["PARALLEL"] == "fsdp",
         sharded_grads=fsdp_grads_sharded(k),
+        gathered=k["FSDP_RESHARD"] == "backward",
         ema_decays=decay_count(k["EMA"]),
         optim_state_bytes=STATE_BYTES.get(k["OPTIMIZER"], STATE_BYTES["adamw"]),
         master_bytes=compute_bytes if k["OPTIMIZER"] == "adamw16" else 4,
+        stored_precision=stored_dit_precision(k),
     )
 
 
@@ -116,9 +131,11 @@ def fsdp_grads_sharded(k: dict) -> bool:
 def auto_text(k: dict, device: torch.device):
     """The `auto` planner's text-encoder term: (TextSizes from its config, tokens per
     pass / call, the placement rule per candidate plan), or None when text is not
-    encoded online on `device`."""
-    path = _component_path(k, "TEXT_ENCODER", "text_encoder")
-    if k["TEXT_CACHE"] == "offline" or not path or not Path(path).exists():
+    encoded online on `device` (none on the training card under the encode feed)."""
+    path = component_path(k, TEXT)
+    if k["TEXT_CACHE"] == "offline" or k["ENCODE_DEVICES"]:
+        return None
+    if not path or not Path(path).exists():
         return None
     plan, te_device = training_text_plan(k, device)
     if plan.memory == "cpu" or te_device != torch.device(device):
@@ -205,9 +222,8 @@ def seeded_rng(seed: int, device: torch.device):
     with rng_kept([device]):
         torch.random.default_generator.manual_seed(seed)
         if streamed(device):
-            dm = accel_module(device)
-            index = dm.current_device() if device.index is None else device.index
-            dm.default_generators[index].manual_seed(seed)
+            index = with_index(device).index
+            accel_module(device).default_generators[index].manual_seed(seed)
         yield
 
 
@@ -231,16 +247,24 @@ def build_model(
     prec: PrecisionConfig,
     world: int = 1,
     text_tokens: int | None = None,
+    feed=None,
 ) -> Built:
     """Build order of types/context.py up to (not including) the parallel wrap and compile:
-    load on the host -> FP16_FIX -> memory plan (quantize, place or stream onto
-    `device`, offload, runner) -> trainable -> parameter dtypes -> bind_ops -> encoders.
-    `text_tokens`: the dataset's longest caption, for the `auto` plan.
+    memory plan -> load on the host (the weights the plan quantizes left unread, read
+    from the checkpoint by the quantizer) -> FP16_FIX -> the plan applied (quantize,
+    place or stream onto `device`, offload, runner) -> trainable -> parameter dtypes
+    -> bind_ops -> encoders -> TEACHER -> the C heap's freed pages returned.
+    `text_tokens`: the dataset's longest caption, for the `auto` plan; `feed`: the
+    rank's StreamedLoader under the encode feed (the encoders run in the encoder
+    processes).
     """
-    backbone = build_backbone(k, torch.device("cpu"), prec)
-    apply_fp16_fix(backbone, prec.fp16_fix, **prec.fp16_fix_kwargs)
     plan, auto_rows = resolve_memory(k, device, prec.compute, world, text_tokens)
     full = is_full(k)
+    defer = partial(
+        quantized_weights, plan=plan, trainable_base=full, keep_fp32=prec.keep_fp32
+    )
+    backbone = build_backbone(k, torch.device("cpu"), prec, defer)
+    apply_fp16_fix(backbone, prec.fp16_fix, **prec.fp16_fix_kwargs)
     engines = apply_to_backbone(
         backbone,
         plan,
@@ -256,12 +280,23 @@ def build_model(
     apply_param_dtypes(backbone, prec, _ids(trainable), k["OPTIMIZER"] == "adamw16")
     engines.exclude_params(trainable.trainable_params())
     backbone.bind_ops(OpSet.resolve(device, prec.compute, k["KERNELS"]))
-    vae, text, embeds = build_encoders(k, device, prec, step_reserve(k, plan), plan)
-    return Built(backbone, trainable, plan, engines, vae, text, embeds)
+    reserve = step_reserve(k, plan)
+    if feed is None:
+        vae, text, embeds = build_encoders(k, device, prec, reserve, plan)
+    else:
+        vae, text, embeds = fed_encoders(k, device, reserve, plan, feed)
+    teacher = build_teacher(k, device)
+    trim_heap()
+    return Built(backbone, trainable, plan, engines, vae, text, embeds, feed, teacher)
 
 
-def _component_path(k: dict, knob: str, sub: str) -> str:
-    return k[knob] or os.path.join(k["WEIGHTS"], sub)
+def component_path(k: dict, which: str) -> str:
+    """The path of component `which` ("" when a ComfyUI folder holds none: the knob
+    checks report that)."""
+    try:
+        return str(component(k, which))
+    except FileNotFoundError:
+        return ""
 
 
 def placement_lines(k: dict, built: Built, device) -> list[tuple[str, dict]]:
@@ -270,11 +305,14 @@ def placement_lines(k: dict, built: Built, device) -> list[tuple[str, dict]]:
     te, vae = encoder_lines(
         built.text_encoder,
         built.vae,
-        _component_path(k, "TEXT_ENCODER", "text_encoder"),
-        _component_path(k, "VAE", "vae"),
+        component_path(k, TEXT),
+        component_path(k, VAE),
         device,
     )
-    if te is None:
+    if built.feed is not None:
+        on = built.feed.text.device
+        te = (f"text encoder and VAE encoding: the encode feed on {hl(on)}", {})
+    elif te is None:
         sampled = " (the sample prompts were encoded at build, then it was freed)"
         why = sampled if k["SAMPLE_EVERY"] > 0 else ""
         te = (f"text encoder: not kept, TEXT_CACHE='offline'{why}", {})
@@ -288,7 +326,11 @@ def step_reserve(k: dict, plan) -> int:
     MAX_TOKENS): what an `auto` text-encoder placement must leave free."""
     cfg = resolve_config(k["VARIANT"], k["ARCH_OVERRIDES"] or None)
     work = Workload(
-        cfg, img_tokens=int(k["MAX_TOKENS"]), txt_tokens=0, full_ft=is_full(k)
+        cfg,
+        img_tokens=int(k["MAX_TOKENS"]),
+        txt_tokens=0,
+        full_ft=is_full(k),
+        stored_precision=stored_dit_precision(k),
     )
     est = estimate(work, plan)
     return max(est.total - est.parts.get("weights", 0), 0)
@@ -296,6 +338,7 @@ def step_reserve(k: dict, plan) -> int:
 
 STREAMED_BASE_ENCODERS = {"vae": "offload"}
 ENCODER_KNOBS = {"text": "TEXT_ENCODE", "vae": "VAE_ENCODE"}
+ENCODER_ALIASES = {"text": TEXT_MEMORY_ALIASES, "vae": VAE_MEMORY_ALIASES}
 
 
 def streamed_base(plan) -> bool:
@@ -307,10 +350,11 @@ def encoder_memory(k: dict, which: str, default: str, plan=None) -> str:
     """The placement of encoder `which` ("text" / "vae"): its TEXT_ENCODE /
     VAE_ENCODE `memory` when set; else `default` (the text encoder's `auto`: the
     fastest placement that fits next to the DiT step, whatever the plan), and for the
-    VAE offload when `plan` streams the DiT blocks."""
+    VAE offload when `plan` streams the DiT blocks. A given `memory` comes in its
+    primary spelling (the encoder's `MEMORY_ALIASES`)."""
     given = dict(k.get(ENCODER_KNOBS[which]) or {}).get("memory")
     if given is not None:
-        return given
+        return ENCODER_ALIASES[which].get(given, given)
     if streamed_base(plan):
         return STREAMED_BASE_ENCODERS.get(which, default)
     return default
@@ -344,13 +388,14 @@ def training_text_plan(k: dict, device: torch.device, plan=None):
 
 def data_knobs(k: dict, device: torch.device) -> dict:
     """The knobs the run's DataConfig reads: `k` plus the encoder compute specs its
-    cache keys record (VAE_DTYPE resolved on `device`; the text encoder's resolved
-    dtype, precision and quantization layout)."""
+    cache keys record (VAE_DTYPE resolved for `device`; the text encoder's dtype
+    resolved for `device`, its precision for where it computes, its quantization
+    layout), whatever the encoders' placements."""
     plan, te_device = training_text_plan(k, device)
     on = torch.device("cpu") if plan.memory == "cpu" else te_device
-    plan = resolve_dtype(plan, on)
+    plan, _, layout = resolve_text_plan(component_path(k, TEXT), plan, on, device)
     vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
-    return {**k, **cache_specs(vae_dtype, plan, TEXT_DTYPES[plan.dtype])}
+    return {**k, **cache_specs(vae_dtype, plan, TEXT_DTYPES[plan.dtype], layout)}
 
 
 def sample_texts(k: dict) -> list[str]:
@@ -371,31 +416,28 @@ def build_encoders(
     sampling = k["SAMPLE_EVERY"] > 0
     need_vae = k["LATENT_CACHE"] != "offline" or sampling
     vae = text = embeds = None
-    vae_path = _component_path(k, "VAE", "vae")
-    text_path = _component_path(k, "TEXT_ENCODER", "text_encoder")
+    vae_path = component_path(k, VAE)
+    text_path = component_path(k, TEXT)
     if need_vae and vae_path:
-        vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
-        vae = place_vae(
-            FluxVae.from_pretrained(vae_path, "cpu", vae_dtype, k["LATENT_DRAW"]),
-            {
-                **dict(k.get("VAE_ENCODE") or {}),
-                "memory": encoder_memory(k, "vae", "resident", mem_plan),
-            },
-            device,
-            reserve,
-            int(k["TARGET_AREA"]),
-        )
-        rule = encoder_rule(k, "vae", mem_plan)
-        log.info(f"VAE placement: {hl(vae.plan.memory)} ({rule})")
+        vae = training_vae(k, device, reserve, mem_plan, vae_path)
     if (online_text or sampling) and text_path:
         plan, te_device = training_text_plan(k, device, mem_plan)
         if not online_text:
             plan = replace(plan, free_after_use=True)
         hold = device if plan.ahead_device == "device" else torch.device("cpu")
         choose = partial(default_auto_memory, plan=plan, reserve=reserve)
+        w4a8 = partial(default_w4a8, plan=plan, reserve=reserve)
         text = QwenTextEncoder.from_pretrained(
-            text_path, te_device, plan, output_device=hold, auto_memory=choose
+            text_path,
+            te_device,
+            plan,
+            output_device=hold,
+            auto_memory=choose,
+            auto_w4a8=w4a8,
+            run_device=device,
         )
+        if plan.ahead_device == "auto":
+            text.output_to(ahead_device(text, device))
         rule = encoder_rule(k, "text", mem_plan)
         log.info(f"text encoder placement: {hl(text.plan.memory)} ({rule})")
         if sampling:
@@ -405,18 +447,48 @@ def build_encoders(
     return vae, text, embeds
 
 
-def export(k: dict, built: Built, output_dir: str, metadata: dict) -> list[Path]:
-    """Every EXPORT_FORMATS output under `<output>/export/`."""
-    root = Path(output_dir) / "export"
-    root.mkdir(parents=True, exist_ok=True)
-    name = run_name(k)
-    out = []
-    order = ("lycoris", "comfy", "merged", "diffusers")
-    for fmt in sorted(k["EXPORT_FORMATS"], key=order.index):
-        suffix = "" if fmt == "diffusers" else ".safetensors"
-        path = root / f"{name}-{fmt}{suffix}"
-        built.trainable.export(
-            str(path), fmt, metadata, row_scales=output_row_scales(built.backbone)
-        )
-        out.append(path)
-    return out
+def ahead_device(text, device: torch.device) -> torch.device:
+    """Where TEXT_ENCODE ahead_device 'auto' holds the embeddings: the training device
+    when the placed encoder is resident on it, else the host."""
+    resident = text.plan.memory == "resident" and text.device == torch.device(device)
+    return torch.device(device) if resident else torch.device("cpu")
+
+
+def training_vae(k: dict, device, reserve: int, mem_plan, vae_path: str):
+    """The VAE placed on `device` by VAE_ENCODE (an unset memory follows the memory
+    plan, `encoder_memory`)."""
+    vae_dtype = resolve_vae_dtype(k.get("VAE_DTYPE", "auto"), device)
+    vae = place_vae(
+        FluxVae.from_pretrained(vae_path, "cpu", vae_dtype, k["LATENT_DRAW"]),
+        {
+            **dict(k.get("VAE_ENCODE") or {}),
+            "memory": encoder_memory(k, "vae", "resident", mem_plan),
+        },
+        device,
+        reserve,
+        int(k["TARGET_AREA"]),
+    )
+    rule = encoder_rule(k, "vae", mem_plan)
+    log.info(f"VAE placement: {hl(vae.plan.memory)} ({rule})")
+    return vae
+
+
+def fed_encoders(k: dict, device, reserve: int, mem_plan, feed):
+    """(VAE, text encoder, sample-prompt embeddings) of a rank under the encode feed:
+    no text encoder; the sample-prompt embeddings from the encoder processes and a VAE
+    for decoding samples, on the sampling rank only."""
+    feed.connect()
+    if k["SAMPLE_EVERY"] <= 0 or dist_rank()[0] != 0:
+        return None, None, None
+    embeds = [t.to(device) for t in feed.samples]
+    vae_path = component_path(k, VAE)
+    vae = training_vae(k, device, reserve, mem_plan, vae_path) if vae_path else None
+    return vae, None, embeds
+
+
+def export(k: dict, built: Built, root: Path, metadata: dict) -> list[Path]:
+    """Every export file of the knobs (`training.exports.export_files`) under `root`."""
+    files = export_files(k, fused_qkv(k))
+    return write_exports(
+        files, built.trainable, built.backbone, root, run_name(k), metadata
+    )

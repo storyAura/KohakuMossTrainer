@@ -3,9 +3,11 @@
 import contextlib
 from collections.abc import Callable, Iterable, Iterator
 
+from kohakumoss.logging.phases import BACKWARD, DATA, FORWARD, OPTIMIZER, phase
 from kohakumoss.training.state import TrainState
 from kohakumoss.training.step import image_token_count, image_tokens_per_sample
 from kohakumoss_common.calls import nothing
+from kohakumoss_kernels.registry import settle_guards
 
 
 def no_accumulate(last: bool):
@@ -57,32 +59,67 @@ def account(state: TrainState, group: list) -> None:
 def micro_steps(
     step, batcher, accumulate, lasts, bundle, group, denom, index: int, ema=None
 ):
-    """Forward + backward of one optimiser step's micro-batches; the last StepOut.
+    """Forward + backward of one optimiser step's micro-batches; the last StepOut, with
+    no autograd graph attached (each micro-batch's graph ends with its backward), its
+    metrics the mean over the micro-batches (device tensors, no host read).
     `ema.join` (an EMA updating in the background) runs before each backward."""
     join = getattr(ema, "join", nothing)
     out = None
+    sums: dict = {}
     for hb, last in zip(group, lasts):
-        batch = batcher(hb)
+        with phase(DATA):
+            batch = batcher(hb)
         with accumulate(last):
-            out = step(batch, denom, index)
+            with phase(FORWARD):
+                out = step(batch, denom, index)
             join()
-            bundle.backward(out.loss)
+            with phase(BACKWARD):
+                bundle.backward(out.loss)
+            out = out.detached()
+        for name, value in out.metrics.items():
+            sums[name] = value if name not in sums else sums[name] + value
+    n = len(group)
+    out.metrics = {name: value / n for name, value in sums.items()} if n > 1 else sums
     return out
 
 
 def finish_step(state: TrainState, group: list, bundle, ema, runner, out) -> None:
     """After a group's backward: count it, apply the optimiser step (EMA on success),
+    bind the plain call path of the kernels proven in this step (`settle_guards`),
     advance `state.step`, record the step and run the callbacks."""
     account(state, group)
-    if bundle.step():
+    with phase(OPTIMIZER):
+        ok = bundle.step()
+    out.metrics.update(bundle.extra_metrics())
+    if ok:
         ema.update(state.step)
+    settle_guards()
     state.step += 1
     record(state, bundle)
     runner.run(state, out)
 
 
 def record(state: TrainState, bundle) -> None:
-    """Copy the bundle's host-side step results into `state`."""
+    """Copy the bundle's host-side step results into `state`; a deferred bundle
+    (`sync_due`) brings them back on its sync steps only (`state.synced` False between).
+    """
+    sync_due = getattr(bundle, "sync_due", None)
+    if sync_due is not None:
+        sync_due(state.step)
+        state.synced = bundle.synced
+        state.lr = bundle.lr
+        if not bundle.synced:
+            return
+        state.bad_run = bundle.bad_run
+        state.loss, state.grad_norm, state.ok = (
+            bundle.last_loss,
+            bundle.last_norm,
+            bundle.last_ok,
+        )
+        state.scale = bundle.host_scale
+        state.skipped, state.nonfinite = bundle.skipped, bundle.nonfinite
+        state.nonfinite_params, state.nonfinite_names = 0, []
+        return
     state.loss = bundle.last_loss
     state.grad_norm = bundle.last_norm
     state.ok = bundle.last_ok

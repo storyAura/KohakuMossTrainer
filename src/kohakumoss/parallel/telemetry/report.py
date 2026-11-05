@@ -15,9 +15,9 @@ import torch.distributed as dist
 
 from kohakumoss.model.flops import forward_flops, peak_tflops, step_flops
 from kohakumoss.parallel.telemetry.trace import ProfilerWindow, StepTrace
+from kohakumoss_common.units import GIB
 from kohakumoss_kernels.hardware.memory import close_window, device_used, open_window
 
-GIB = 2**30
 COUNTS = ("step", "samples", "tokens", "text_tokens", "joint_sq")
 PEAKS = ("vram_peak_alloc_gib", "vram_peak_reserved_gib", "device_used_gib")
 HOST = ("host_rss_gib", "host_private_gib", "host_shared_gib")
@@ -311,10 +311,11 @@ def build_rank_callbacks(
     extra_devices=(),
 ) -> list:
     """The profiled windows (TRACE_STEPS / PROFILE_STEPS = (first, last), empty = none;
-    `extra_devices` are traced too) and the per-rank report at the metric-row cadence,
-    writing to `<output>/ranks/`. `data_world`: ranks drawing distinct data (world under
-    data parallelism, 1 under the pipeline); `share`: this rank's fraction of the
-    model's FLOPs."""
+    `extra_devices` are traced too) and, at METRICS_LEVEL 'bench' / 'debug' or with a
+    profiled window, the per-rank report at the metric-row cadence, writing to
+    `<output>/ranks/`. `data_world`: ranks drawing distinct data (world under data
+    parallelism, 1 under the pipeline); `share`: this rank's fraction of the model's
+    FLOPs."""
     root = str(Path(output_dir) / "ranks")
     every = k["LOG_EVERY"] if k.get("METRICS_EVERY") is None else k["METRICS_EVERY"]
     trace = tuple(k["TRACE_STEPS"])
@@ -329,6 +330,8 @@ def build_rank_callbacks(
         first, last = int(window[0]), int(window[1])
         cbs.append(ProfilerWindow(first, last, device))
         exclude = exclude | frozenset(range(first + 1, last + 1))
+    if k.get("METRICS_LEVEL", "train") == "train" and not cbs:
+        return []
     report = RankReport(
         every,
         root,

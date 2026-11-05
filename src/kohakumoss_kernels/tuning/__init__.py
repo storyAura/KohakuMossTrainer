@@ -1,10 +1,9 @@
 """Config selection: analytical planner -> timed shortlist -> on-disk table per card."""
 
 from kohakumoss_kernels.tuning.prewarm import attention_lengths, prewarm_attention
+from kohakumoss_kernels.tuning.ranks import agree, broadcast
 from kohakumoss_kernels.tuning.tuner import (
     MODES,
-    agree,
-    broadcast,
     decided,
     forget,
     get_mode,
@@ -12,6 +11,7 @@ from kohakumoss_kernels.tuning.tuner import (
     set_mode,
     table,
     timing_allowed,
+    will_time,
 )
 
 __all__ = [
@@ -27,4 +27,5 @@ __all__ = [
     "set_mode",
     "table",
     "timing_allowed",
+    "will_time",
 ]

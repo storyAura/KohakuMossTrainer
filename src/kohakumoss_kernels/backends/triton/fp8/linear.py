@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from kohakumoss_common.log import get_logger
-from kohakumoss_kernels import registry, tuning
+from kohakumoss_kernels import compile_setup, registry, tuning
 from kohakumoss_kernels.backends.triton.fp8.fused import FUSED
 from kohakumoss_kernels.backends.triton.fp8.gemm import (
     dot_scaled_mm,
@@ -89,7 +89,7 @@ def candidates(
     recipe: str, sm: int, m: int, fp8: bool = True, k: int | None = None
 ) -> list[dict]:
     """Every GEMM path of `recipe` on `sm` for M rows, the planner's first pick first;
-    `fp8=False` (no dgrad copy) leaves only the 16-bit paths. With the contraction
+    `fp8=False` (one fp8 weight copy) leaves only the 16-bit paths. With the contraction
     length `k`, mx paths that read whole 128-column tiles are left out when
     `k % 128`."""
     if not fp8:
@@ -155,6 +155,7 @@ def _w16_dgrad(recipe, dy, q, scale):
 
 @functools.cache
 def _compiled(fn):
+    compile_setup.apply()
     return torch.compile(fn, dynamic=True)
 
 

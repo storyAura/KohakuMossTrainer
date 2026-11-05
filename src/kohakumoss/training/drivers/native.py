@@ -53,6 +53,7 @@ class NativeDriver:
     def run(self, step, loader, bundle, ema, state: TrainState) -> TrainState:
         groups = grouped(loader, self.grad_acc)
         self.runner.reset(state.step)
+        self.runner.start(state)
         out = None
         while state.step < self.steps:
             group = next(groups)
@@ -60,8 +61,7 @@ class NativeDriver:
             out = self.run_group(step, group, count, bundle, state, ema)
             self.end_step()
             finish_step(state, group, bundle, ema, self.runner, out)
-        if not self.checkpoints.saved(state.step):
-            self.checkpoints.save(state.step, self.parts(state))
+        self.checkpoints.finish(state.step, self.parts(state))
         return state
 
     def run_group(

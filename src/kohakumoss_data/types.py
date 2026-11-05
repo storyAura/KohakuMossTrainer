@@ -1,13 +1,12 @@
-"""Data-side types and protocols. No model code, no torch.distributed."""
+"""Data-side types."""
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
 
 import numpy as np
 from torch import Tensor
 
-EncodeImages = Callable[[Sequence[np.ndarray], Tensor], Tensor]
+EncodeImages = Callable[[Sequence[Tensor | np.ndarray], Tensor], Tensor]
 """uint8 HWC images + target hw [B, 2] (latent grid) -> packed latents [N_img, C]."""
 
 EncodeText = Callable[[Sequence[str]], list[Tensor]]
@@ -49,6 +48,17 @@ class PlanItem:
     keep_seed: int = 0
 
 
+@dataclass(frozen=True)
+class RowGeometry:
+    """A row's stored size (w, h), its training target (h, w) and the centre crop box
+    (l, t, r, b) in stored pixels the target is resized from."""
+
+    w: int
+    h: int
+    target_hw: tuple[int, int]
+    crop_ltrb: tuple[int, int, int, int]
+
+
 @dataclass
 class BatchPlan:
     """A whole batch decided by a planner; a pure function of (seed, rank, index)."""
@@ -56,6 +66,13 @@ class BatchPlan:
     index: int
     items: list[PlanItem]
     token_budget: int = 0
+
+
+def _pinned(value):
+    """`value` in pinned memory when it is a tensor, else as is."""
+    if isinstance(value, Tensor) and not value.is_pinned():
+        return value.pin_memory()
+    return value
 
 
 @dataclass
@@ -72,7 +89,7 @@ class HostBatch:
     img_keep: list[Tensor | None] | None = None
     latents: Tensor | None = None
     text: Tensor | None = None
-    pixels: list[np.ndarray] | None = None
+    pixels: list[Tensor] | None = None
     prompts: list[str] | None = None
     loss_mask: Tensor | None = None
     index: int = -1
@@ -83,42 +100,18 @@ class HostBatch:
     layout: object | None = None
 
     def pin(self) -> "HostBatch":
-        """Pin every tensor field in place; returns self."""
+        """Pin every tensor field, every tensor of a list field and the `layout` (its
+        `pin_memory()`) in place; returns self. See docs/concepts/data.md#hostbatch."""
         for name, value in self.__dict__.items():
-            if isinstance(value, Tensor) and not value.is_pinned():
-                setattr(self, name, value.pin_memory())
+            match value:
+                case Tensor():
+                    setattr(self, name, _pinned(value))
+                case list():
+                    setattr(self, name, [_pinned(v) for v in value])
+                case _ if hasattr(value, "pin_memory"):
+                    setattr(self, name, value.pin_memory())
         return self
 
     def pin_memory(self) -> "HostBatch":
         """DataLoader pin-memory hook."""
         return self.pin()
-
-
-class Source(Protocol):
-    """A dataset backend that can enumerate records and open their image bytes."""
-
-    def scan(self) -> Iterator[CatalogRow]: ...
-
-    def open(self, locator: str) -> bytes: ...
-
-
-class Planner(Protocol):
-    """Decides batch `index` for `rank` of `world` from the catalog."""
-
-    def plan(self, index: int, rank: int, world: int) -> BatchPlan: ...
-
-
-class CaptionTemplate(Protocol):
-    """Renders a caption string for a row with a seeded generator."""
-
-    def render(self, row: CatalogRow, rng: np.random.Generator) -> str: ...
-
-
-class Cache(Protocol):
-    """Content-addressed tensor cache (latents or text embeddings)."""
-
-    def key(self, row: CatalogRow, item: PlanItem) -> str: ...
-
-    def get(self, key: str) -> Tensor | None: ...
-
-    def put(self, key: str, value: Tensor) -> None: ...

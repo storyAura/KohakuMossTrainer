@@ -50,7 +50,6 @@ def text_cache(weights_root, dataset_slice, tmp_path_factory) -> Path:
     """The offline text cache of the slice (every caption variant, the real encoder)."""
     cache = tmp_path_factory.mktemp("text_cache")
     k = real_knobs(weights_root, dataset_slice, cache, CACHE_DIR=str(cache), **SHORT)
-    cfg = data_config(k, latent_cache="off", text_cache="offline")
     encode = build_encoder(
         "kohakumoss.encoders.text_encoder",
         {
@@ -58,6 +57,12 @@ def text_cache(weights_root, dataset_slice, tmp_path_factory) -> Path:
             "device": "cuda",
             "plan": {"memory": "stream"},
         },
+    )
+    cfg = data_config(
+        k,
+        latent_cache="off",
+        text_cache="offline",
+        text_encoder_spec=encode.encoder_spec,
     )
     build_text(MossDataset(cfg), encode, 64)
     del encode
@@ -209,8 +214,8 @@ def test_resume_reproduces_the_uninterrupted_run(
         "a resume without the step generators: first step",
     )
     must_fail(
-        lambda: check_state(want, load_checkpoint(_ckpt(forgot, STEPS)), again),
-        "a resume without the step generators: step-4 state",
+        lambda: check_state(want, load_checkpoint(_ckpt(straight, SAVED)), again),
+        "the step-2 state given as the resumed step-4 state",
     )
 
 
@@ -290,8 +295,9 @@ def test_swap_cpu_adamw_full_resume(
 ):
     """Full FT, swap-streamed blocks, host AdamW: the resumed run's first step reads
     the restored masters (the streaming copies refreshed), so its loss is the
-    uninterrupted run's. Each run's final checkpoint (every master and moment of the
-    backbone) is removed once written; only the step-2 one stays on disk."""
+    uninterrupted run's. The straight run's final checkpoint (every master and moment of
+    the backbone) is removed once written and the resumed runs write none
+    (SAVE_EVERY=0); only the step-2 one stays on disk."""
     steps = SAVED + 1
 
     def knobs(out: Path, **kw) -> dict:
@@ -308,11 +314,10 @@ def test_swap_cpu_adamw_full_resume(
     shutil.rmtree(_ckpt(straight, steps))
     resume = str(_ckpt(straight, SAVED))
     assert run(knobs(resumed, RESUME=resume, SAVE_EVERY=0)).step == steps
-    shutil.rmtree(_ckpt(resumed, steps))
+    assert not _ckpt(resumed, steps).exists()
     check_first_step(_rows(straight), _rows(resumed), SAVED, steps)
     monkeypatch.setattr(MemoryEngines, "after_restore", _no_refresh)
     run(knobs(stale, RESUME=resume, SAVE_EVERY=0))
-    shutil.rmtree(_ckpt(stale, steps))
     must_fail(
         lambda: check_first_step(_rows(straight), _rows(stale), SAVED, steps),
         "resume without refreshing the streaming copies from the restored masters",

@@ -8,7 +8,6 @@ from kohakumoss.model.numerics.fold import (
     record_row_scales,
     same_fold,
     unfold,
-    unfolded_state_dict,
 )
 from kohakumoss.model.numerics.fp16fix import (
     MODES as FP16_FIX_MODES,
@@ -20,6 +19,7 @@ from kohakumoss.model.numerics.fp16fix import (
     clamp_counts,
     clear_fp16_fix,
     fix_problems,
+    fix_warnings,
 )
 from kohakumoss.model.numerics.keep_fp32 import cast_params
 from kohakumoss.model.numerics.saturation import SaturationCounters
@@ -38,8 +38,8 @@ __all__ = [
     "clamp_counts",
     "clear_fp16_fix",
     "fix_problems",
+    "fix_warnings",
     "fold",
     "output_row_scales",
     "unfold",
-    "unfolded_state_dict",
 ]

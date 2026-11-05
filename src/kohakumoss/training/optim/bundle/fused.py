@@ -11,7 +11,7 @@ from torch.optim import Optimizer
 
 from kohakumoss.training.optim.bundle.base import (
     close_optimizers,
-    no_agree,
+    no_metrics,
     step_reducer,
 )
 from kohakumoss.training.optim.bundle.mirror import LRHolder
@@ -22,11 +22,16 @@ from kohakumoss.training.optim.optimizers.skip import (
     put_back,
     restore_host,
 )
-from kohakumoss_common.calls import nothing
+from kohakumoss_common.calls import identity, nothing
+from kohakumoss_common.weak import weak_method
 
 
-def _unclipped(inv: Tensor) -> Tensor:
+def _unclipped(bundle, inv: Tensor) -> Tensor:
     return inv
+
+
+def _shared_update(step_param: Callable, bundle, param: Tensor, found: Tensor) -> None:
+    step_param(param, found)
 
 
 def next_clip(max_norm: float, norm: Tensor, prev: Tensor) -> Tensor:
@@ -37,6 +42,20 @@ def next_clip(max_norm: float, norm: Tensor, prev: Tensor) -> Tensor:
 
 def _decay_to_one(coef: float, p: Tensor, lr: float, found: Tensor) -> None:
     p.sub_((p - 1.0) * ((1.0 - found) * (lr * coef)).to(p.dtype))
+
+
+def _decay_to_anchor(wd: float, anchor: Tensor, p: Tensor, lr: float, found: Tensor):
+    p.addcmul_(anchor, ((1.0 - found) * (lr * wd)).to(p.device))
+
+
+def _post_of(g: dict, index: int) -> Callable:
+    """The per-parameter post-step of parameter `index` of group `g`: decay-to-one,
+    the decay-to-start pull, or nothing."""
+    if g.get("decay_to_one"):
+        return partial(_decay_to_one, g["decay_to_one_coef"])
+    if g.get("anchor"):
+        return partial(_decay_to_anchor, g["weight_decay"], g["anchor"][index])
+    return nothing
 
 
 def _step_plain(opt: Optimizer) -> None:
@@ -119,10 +138,10 @@ class FusedStepBundle:
         schedule_factory: Callable[[Optimizer], object],
         scaler,
         groups: list[dict],
-        agree: Callable[[Tensor], Tensor] = no_agree,
+        agree: Callable[[Tensor], Tensor] = identity,
         before: Callable[[], None] = nothing,
         after: Callable[[], None] = nothing,
-        reduce_loss: Callable[[Tensor], Tensor] = no_agree,
+        reduce_loss: Callable[[Tensor], Tensor] = identity,
         clip: float = 0.0,
         shared=None,
         device: torch.device | None = None,
@@ -131,7 +150,7 @@ class FusedStepBundle:
         self.scaler = scaler
         self.reduce = step_reducer(reduce_loss, agree, reduce_step)
         self.max_norm = clip
-        self.factor = self._clipped if clip > 0 else _unclipped
+        self.factor = FusedStepBundle._clipped if clip > 0 else _unclipped
         self.hooks = None
         self.blocks = None
         self._start = _no_start
@@ -143,13 +162,14 @@ class FusedStepBundle:
         self.shared = shared
         self.optimizer = None
         self.finishers: list[Callable[[], None]] = []
+        self.extra_metrics = no_metrics
         self.reduce_block_stats: Callable[[Tensor, Tensor], None] = nothing
         self._lr0 = float(groups[0]["lr"]) if groups else 1.0
         self._block_lr: list[tuple[dict, float]] = []
         if shared is not None:
             self.lr_source = shared
             self.schedule = schedule_factory(shared)
-            self.update = shared.step_param
+            self._update = partial(_shared_update, shared.step_param)
             self.opts = {}
             if hasattr(shared, "finish"):
                 self.finishers.append(shared.finish)
@@ -158,17 +178,12 @@ class FusedStepBundle:
             self.schedule = schedule_factory(self.lr_source)
             self.opts: dict[int, tuple] = {}
             for gi, g in enumerate(groups):
-                post = (
-                    partial(_decay_to_one, g["decay_to_one_coef"])
-                    if g.get("decay_to_one")
-                    else nothing
-                )
-                for p in g["params"]:
-                    one = {k: v for k, v in g.items() if k != "params"}
+                for i, p in enumerate(g["params"]):
+                    one = {k: v for k, v in g.items() if k not in ("params", "anchor")}
                     one["params"] = [p]
                     opt = build_one([one])
-                    self.opts[id(p)] = (opt, gi, _step_runner(opt), post)
-            self.update = self._own_update
+                    self.opts[id(p)] = (opt, gi, _step_runner(opt), _post_of(g, i))
+            self._update = FusedStepBundle._own_update
         self.device = device if device is not None else self.params[0].device
         self._clip = torch.ones(1, dtype=torch.float32, device=self.device)
         self._reset()
@@ -185,7 +200,9 @@ class FusedStepBundle:
         a FusedStep."""
         self.hooks = hooks
         self._start = (
-            partial(_start_offload, hooks, self.step_param) if finishes else hooks.start
+            partial(_start_offload, hooks, weak_method(self.step_param))
+            if finishes
+            else hooks.start
         )
         if hasattr(hooks, "finish"):
             self.finishers.insert(0, hooks.finish)
@@ -194,7 +211,7 @@ class FusedStepBundle:
         """A per-block in-backward optimiser (StreamedAdamW) sharing the transform; its
         groups follow the schedule (lr scaled like group 0)."""
         self.blocks = blocks
-        blocks.transform = self._block_transform
+        blocks.transform = weak_method(self._block_transform)
         self.finishers.append(blocks.finish)
         self._start = partial(_start_blocks, blocks, self._start)
         self._block_lr = [(g, float(g["lr"])) for g in blocks.param_groups]
@@ -253,7 +270,8 @@ class FusedStepBundle:
         inv = self._inv.to(g.device)
         sq_acc += (norm * inv).square().reshape(()).to(sq_acc.device)
         found = torch.zeros(1, dtype=torch.float32, device=g.device)
-        torch._amp_foreach_non_finite_check_and_unscale_([g], found, self.factor(inv))
+        factor = self.factor(self, inv)
+        torch._amp_foreach_non_finite_check_and_unscale_([g], found, factor)
         bad_acc += found.to(torch.int32).to(bad_acc.device)
         return found.reshape(())
 
@@ -277,7 +295,7 @@ class FusedStepBundle:
     def step_param(self, param: torch.nn.Parameter) -> None:
         """Called by the engine's post-accumulate-grad hook (grad is present)."""
         found = self.transform(param.grad)
-        self.update(param, found)
+        self._update(self, param, found)
         self._flags.append((self.name_of[id(param)], found))
         param.grad = None
 

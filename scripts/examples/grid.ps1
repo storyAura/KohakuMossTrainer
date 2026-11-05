@@ -21,7 +21,7 @@ param(
     [ValidateSet("cuda", "xpu")] [string] $Device = "cuda",
     # GPU index within that kind: cuda -> CUDA_VISIBLE_DEVICES (nvidia-smi order), xpu -> ZE_AFFINITY_MASK.
     [int] $Index = 0,
-    # Weights root (HF layout); text encoder, VAE and tokenizer come from here.
+    # Weights: a ComfyUI models folder or an HF weights root; text encoder, VAE and tokenizer come from here.
     [string] $Weights = $env:KOHAKUMOSS_WEIGHTS,
     # Arch preset: base | sft.
     [ValidateSet("base", "sft")] [string] $Variant = "base",
@@ -68,20 +68,20 @@ param(
     # fp16 residual fix when no -Transformer is given: online | fp32_residual | none.
     [ValidateSet("online", "fp32_residual", "none")] [string] $Fp16Fix = "online",
     # DiT base: compute = 16-bit; int8 / fp8 = weight-only; fp8_compute / mxfp8 = fp8 GEMMs (sm89+).
-    [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "compute",
+    [ValidateSet("auto", "compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $BasePrecision = "auto",
     # DiT fp8_compute scaling: row | tensor | block.
     [ValidateSet("row", "tensor", "block")] [string] $Fp8Recipe = "row",
     # DiT memory profile: auto = the fastest profile that fits the card's free memory | minimal (2 resident
     # blocks, the rest streamed; fits 8 GB) | low | balanced | any catalog name | "" = whole DiT on the GPU.
     [string] $Memory = "auto",
-    # Text encoder: auto | resident | offload | stream (layers from host RAM, ~2 GB) | cpu.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $TextMemory = "auto",
+    # Text encoder: auto | resident | offload | ring (layers from host RAM, ~2 GB; "stream" is accepted too) | cpu.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $TextMemory = "auto",
     # Text-encoder precision: compute | int8 | fp8 | fp8_compute | mxfp8.
     [ValidateSet("compute", "int8", "fp8", "fp8_compute", "mxfp8")] [string] $TextPrecision = "compute",
     # Free the text encoder after the one encode of every prompt.
     [switch] $FreeTextEncoder,
-    # VAE placement: auto | resident | offload | stream | cpu.
-    [ValidateSet("auto", "resident", "offload", "stream", "cpu")] [string] $VaeMemory = "auto",
+    # VAE placement: auto | resident | offload | ring (block rings; "stream" is accepted too) | cpu.
+    [ValidateSet("auto", "resident", "offload", "ring", "stream", "cpu")] [string] $VaeMemory = "auto",
     # VAE dtype: auto | bf16 | fp16 | fp32.
     [ValidateSet("auto", "bf16", "fp16", "fp32")] [string] $VaeDtype = "auto",
     # Prompts per generate batch (one packed DiT forward per step for the whole batch).

@@ -16,7 +16,7 @@ from kohakumoss.training.optim.bundle.nonfinite import (
     nonfinite_count,
     param_names,
 )
-from kohakumoss_common.calls import nothing
+from kohakumoss_common.calls import identity, nothing
 
 
 def local_grad_norm(grads: list[Tensor]) -> Tensor:
@@ -33,10 +33,6 @@ def all_reduce_norm(grads: list[Tensor]) -> Tensor:
     sq = local_grad_norm(grads).square().reshape(1)
     torch.distributed.all_reduce(sq, op=torch.distributed.ReduceOp.SUM)
     return sq.sqrt()[0]
-
-
-def no_agree(flag: Tensor) -> Tensor:
-    return flag
 
 
 def all_reduce_max(flag: Tensor) -> Tensor:
@@ -106,6 +102,64 @@ def decay_to_one(groups: list[dict], optimizer: Optimizer) -> Callable[[], None]
     return apply
 
 
+def anchor_targets(groups: list[dict], optimizer: Optimizer) -> list[tuple]:
+    """(live group, weight decay, params, anchors) of every anchored group."""
+    return [
+        (optimizer.param_groups[i], g["weight_decay"], g["params"], g["anchor"])
+        for i, g in enumerate(groups)
+        if g.get("anchor")
+    ]
+
+
+def anchor_pull(
+    groups: list[dict], optimizer: Optimizer, gated: bool = False
+) -> Callable | None:
+    """p += lr * wd * a on anchored groups after the optimiser's decoupled decay
+    (p -= lr * wd * p): together a decay towards the anchor `a`. `gated`: `apply(bad)`
+    skips it where the device flag `bad` is set. None when no group is anchored."""
+    targets = anchor_targets(groups, optimizer)
+    if not targets:
+        return None
+
+    @torch.no_grad()
+    def ungated() -> None:
+        for live, wd, params, anchors in targets:
+            torch._foreach_add_(params, anchors, alpha=live["lr"] * wd)
+
+    @torch.no_grad()
+    def masked(bad: Tensor) -> None:
+        keep = 1.0 - bad.float()
+        for live, wd, params, anchors in targets:
+            k = keep * (live["lr"] * wd)
+            for p, a in zip(params, anchors):
+                p.addcmul_(a, k.to(p.device))
+
+    return masked if gated else ungated
+
+
+def no_metrics() -> dict[str, Tensor]:
+    """The step metrics of a bundle with none (`extra_metrics`)."""
+    return {}
+
+
+def _chain(*fns) -> Callable[[], None]:
+    live = [f for f in fns if f is not None and f is not nothing]
+    if not live:
+        return nothing
+    if len(live) == 1:
+        return live[0]
+
+    def run() -> None:
+        for f in live:
+            f()
+
+    return run
+
+
+def _given(grads: Callable[[], list[Tensor]], bundle) -> list[Tensor]:
+    return grads()
+
+
 def close_optimizers(*opts) -> None:
     """Stop the host worker threads of the optimisers among `opts` that run them."""
     for opt in opts:
@@ -125,12 +179,12 @@ class Bundle:
         groups: list[dict],
         grad_clip: float,
         grad_norm: Callable[[list[Tensor]], Tensor] = local_grad_norm,
-        agree: Callable[[Tensor], Tensor] = no_agree,
+        agree: Callable[[Tensor], Tensor] = identity,
         train_mode: Callable[[], None] = nothing,
         eval_mode: Callable[[], None] = nothing,
         before: Callable[[], None] = nothing,
         after: Callable[[], None] = nothing,
-        reduce_loss: Callable[[Tensor], Tensor] = no_agree,
+        reduce_loss: Callable[[Tensor], Tensor] = identity,
         grads: Callable[[], list[Tensor]] | None = None,
         device: torch.device | None = None,
         reduce_step: Callable | None = None,
@@ -144,8 +198,10 @@ class Bundle:
         self.params = [p for g in groups for p in g["params"]]
         self.names = param_names(groups)
         self.nonfinite_grads: list[dict] = []
-        self._report = self._device_report if grads is None else self._host_report
-        self._grads = grads or self._device_grads
+        if grads is None:
+            self._report, self._grads = Bundle._device_report, Bundle._device_grads
+        else:
+            self._report, self._grads = Bundle._host_report, partial(_given, grads)
         self._grad_names = grad_names
         self.clip = make_clipper(
             grad_clip, len({p.device for p in self.params}) > 1 or grads is not None
@@ -154,11 +210,15 @@ class Bundle:
         self.reduce = step_reducer(reduce_loss, agree, reduce_step)
         self.before = before
         self.after = after
-        self.post_step = (
-            nothing
-            if getattr(optimizer, "handles_decay_to_one", False)
-            else decay_to_one(groups, optimizer)
+        self.post_step = _chain(
+            (
+                nothing
+                if getattr(optimizer, "handles_decay_to_one", False)
+                else decay_to_one(groups, optimizer)
+            ),
+            anchor_pull(groups, optimizer),
         )
+        self.extra_metrics = no_metrics
         self.train_mode = train_mode
         self.eval_mode = eval_mode
         self.device = device if device is not None else self.params[0].device
@@ -193,7 +253,7 @@ class Bundle:
 
     def step(self) -> bool:
         self.before()
-        grads = self._grads()
+        grads = self._grads(self)
         self.scaler.unscale_(grads)
         norm = self.grad_norm(grads).to(self.device)
         local = (~torch.isfinite(norm)).to(torch.int32).reshape(1)
@@ -212,7 +272,7 @@ class Bundle:
         else:
             self.skipped += 1
             self.nonfinite += 1
-            self.nonfinite_grads = self._report(grads)
+            self.nonfinite_grads = self._report(self, grads)
             self.last_nonfinite_params = nonfinite_count(grads)
         self.after()
         self.schedule.step()

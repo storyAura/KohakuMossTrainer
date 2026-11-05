@@ -1,6 +1,7 @@
 """The sampling memory estimate per phase and the automatic VAE placement, model-free:
 the text-encode, sampling and decode phases each count what the device holds then (the
-peak is the largest), and "auto" tiles the VAE pass before it streams untiled."""
+peak is the largest; a VAE on the host adds nothing to decode), and "auto" tiles the
+VAE pass before it rings untiled."""
 
 from types import SimpleNamespace
 
@@ -19,11 +20,13 @@ GIB = 2**30
 TOKENS = 2 * (64 * 64 + 300)
 
 
-def _place(te_pass: int, vae_bytes: int, resident: bool, tile: bool):
+def _place(te_pass: int, vae_bytes: int, resident: bool, tile: bool, where="cuda"):
     te = SimpleNamespace(footprint=lambda: {"resident_bytes": 0, "pass_bytes": te_pass})
     weights = torch.empty(vae_bytes // 2, dtype=torch.bfloat16, device="meta")
     vae = SimpleNamespace(
-        vae=torch.nn.ParameterList([weights]), plan=VaePlan(tile=tile)
+        vae=torch.nn.ParameterList([weights]),
+        plan=VaePlan(tile=tile),
+        device=torch.device(where),
     )
     return SimpleNamespace(text_encoder=te, vae=vae, vae_on_device=resident)
 
@@ -47,9 +50,19 @@ def test_each_phase_counts_what_it_holds():
     )
     assert tiled["decode"] < est["decode"]
     must_fail(lambda: _phases_add_up(est, 0, vae_bytes, act), "no text-encoder pass")
+    host = peaks.estimated(
+        backbone, plan, TOKENS, _place(te_pass, vae_bytes, False, False, "cpu"), 1 << 20
+    )
+    _host_decode_free(host, est)
+    must_fail(lambda: _host_decode_free(est, est), "a host VAE counted on the device")
 
 
-def test_auto_tiles_before_it_streams_untiled():
+def _host_decode_free(host: dict, gpu: dict) -> None:
+    """A VAE on the host adds nothing to the device's decode phase."""
+    assert host["decode"] < gpu["decode"] and host["vae"] == 0
+
+
+def test_auto_tiles_before_it_rings_untiled():
     weights, reserve, pixels = GIB // 4, 2 * GIB, 1024 * 1024
     roomy = choose_vae_plan(VaePlan(memory="auto"), weights, 8 * GIB, reserve, pixels)
     assert roomy == VaePlan(memory="resident")
@@ -57,4 +70,4 @@ def test_auto_tiles_before_it_streams_untiled():
     plan = choose_vae_plan(VaePlan(memory="auto"), weights, tight, reserve, pixels)
     assert plan.tile and plan.memory in ("offload", "resident"), plan
     asked = choose_vae_plan(VaePlan(memory="auto", tile=True), weights, 0, 0, pixels)
-    assert asked.tile and asked.memory == "stream"
+    assert asked.tile and asked.memory == "ring"

@@ -3,10 +3,11 @@
 import os
 from dataclasses import dataclass, field
 
+from kohakumoss_common.typecheck import describe, mismatches
 from kohakumoss_data.cache.store import STORAGE
 from kohakumoss_data.cache.tensor_cache import MODES
 from kohakumoss_data.loader.decode import BACKGROUNDS, RESAMPLE
-from kohakumoss_data.registry import PLANNERS
+from kohakumoss_data.registry import CAPTIONS, PLANNERS, SOURCES
 from kohakumoss_data.resolution.batching import BATCHINGS
 from kohakumoss_data.resolution.geometry import LATENT_FACTOR
 from kohakumoss_data.resolution.overlong import OVERLONG
@@ -49,7 +50,7 @@ class DataConfig:
     text_encoder_spec: str = ""
     latent_factor: int = LATENT_FACTOR
     flip: bool = False
-    background: str = "white"
+    background: str | tuple[int, int, int] = "white"
     resample: str = "lanczos"
     text_chars_per_token: float = 3.5
     text_overhead_tokens: int = 12
@@ -61,6 +62,8 @@ class DataConfig:
     data_rescan: bool | str = False
     data_scan_workers: int = 8
     data_wait: float = 3600.0
+    data_balance: bool = False
+    grad_acc: int = 1
 
     @classmethod
     def from_knobs(cls, knobs: dict) -> "DataConfig":
@@ -104,10 +107,22 @@ def _default_cache_dir(cfg: DataConfig) -> str:
     return os.path.join(root, "cache")
 
 
+def type_problems(cfg: DataConfig) -> list[str]:
+    """One line per field whose value does not have its annotated type
+    (`kohakumoss_common.typecheck.matches`: a float field takes an int)."""
+    return [
+        f"{name.upper()}={value!r} is not {describe(annotation)}"
+        for name, value, annotation in mismatches(cfg)
+    ]
+
+
 def data_problems(cfg: DataConfig) -> list[str]:
     """Every knob combination that would make `MossDataset(cfg)` (or its first batch)
-    fail; empty when the config builds."""
-    problems = []
+    fail; empty when the config builds. A field of the wrong type is reported alone
+    (`type_problems`), ahead of the checks that read its value."""
+    problems = type_problems(cfg)
+    if problems:
+        return problems
     for name, value, allowed in (
         ("RESOLUTION_MODE", cfg.resolution_mode, PLANNERS.names()),
         ("BATCHING", cfg.batching, sorted(BATCHINGS)),
@@ -150,7 +165,29 @@ def data_problems(cfg: DataConfig) -> list[str]:
         )
     if cfg.max_tokens < 2:
         problems.append("MAX_TOKENS must be >= 2")
-    return problems
+    return problems + entry_problems(cfg)
+
+
+def entry_problems(cfg: DataConfig) -> list[str]:
+    """Per dataset entry: its source's own checks (`problems(entry)`), and a caption
+    template that reads the row geometry (`geometric`) under a crop or flip it cannot
+    follow (a random crop, a flip)."""
+    out = []
+    random_crop = cfg.crop == "random" or cfg.resolution_mode == "shifted_square"
+    for entry in cfg.datasets:
+        name = entry.get("source")
+        source = SOURCES.get(name) if name in SOURCES else None
+        if source is not None and hasattr(source, "problems"):
+            out += source.problems(entry)
+        caption = entry.get("caption", cfg.caption) or {}
+        kind = caption.get("template", "tags") if isinstance(caption, dict) else caption
+        template = CAPTIONS.get(kind) if kind in CAPTIONS else None
+        if getattr(template, "geometric", False) and (random_crop or cfg.flip):
+            out.append(
+                f"caption template {kind!r} follows the row's centre crop: needs "
+                "CROP='center', FLIP=False and not RESOLUTION_MODE='shifted_square'"
+            )
+    return out
 
 
 def pipeline_problems(cfg: DataConfig) -> list[str]:

@@ -15,8 +15,10 @@ from torch.nn.parallel import DistributedDataParallel
 
 from kohakumoss.offload.accel import module, streamed
 from kohakumoss.parallel.telemetry.timing import build_clock
+from kohakumoss_common.runs import runs_within
+from kohakumoss_common.units import MIB
+from kohakumoss_common.weak import weak_call, weak_method
 
-MIB = 2**20
 WIDE_AHEAD = 2  # reduce-dtype bucket copies in flight before the oldest one lands
 
 
@@ -35,6 +37,9 @@ class _Bucket:
         )
         wide = reduce_dtype is not None and reduce_dtype != p0.dtype
         self.reduce_dtype = reduce_dtype if wide else None
+        self.narrow = wide and (
+            torch.empty((), dtype=reduce_dtype).element_size() < p0.element_size()
+        )
         self.wide: Tensor | None = None
         self.views = []
         offset = 0
@@ -53,7 +58,7 @@ class _Bucket:
         self.wide = self.flat.to(self.reduce_dtype)
         return self.wide
 
-    def land(self) -> None:
+    def copy_back(self) -> None:
         """After the reduction: the summed copy back into the gradients' buffer."""
         if self.wide is not None:
             self.flat.copy_(self.wide)
@@ -82,7 +87,7 @@ class _Bucket:
                 p.grad = view
 
 
-def _skip(bucket: _Bucket, p: Tensor) -> None:
+def _skip(reducer, bucket: _Bucket, p: Tensor) -> None:
     return None
 
 
@@ -92,9 +97,11 @@ class GradReducer:
 
     Gradients are views into the bucket buffers (no copy in or out); a bucket of a
     dtype other than `reduce_dtype` (default fp32) is summed on a copy in it (None:
-    in the parameters' dtype), and at most WIDE_AHEAD such copies are alive: launching
-    one more lands the oldest. `finish` makes the compute stream wait for the
-    reductions and its device time is the exposed communication (`metrics`)."""
+    in the parameters' dtype), and at most WIDE_AHEAD wider copies are alive: launching
+    one more lands the oldest. Narrower copies (fp32 gradients summed in bf16) are not
+    capped: together they hold at most half the gradient bytes. `finish` makes the
+    compute stream wait for the reductions and its device time is the exposed
+    communication (`metrics`)."""
 
     def __init__(
         self,
@@ -128,15 +135,15 @@ class GradReducer:
         self.next = 0
         self.widened: list[_Bucket] = []
         self.handles = [
-            p.register_post_accumulate_grad_hook(partial(self._hook, bucket))
-            for bucket in self.buckets
+            p.register_post_accumulate_grad_hook(weak_call(GradReducer._hook, self, i))
+            for i, bucket in enumerate(self.buckets)
             for p in bucket.params
         ]
 
     def start(self, last_microbatch: bool) -> None:
         """Reduce during this backward (last micro-batch) or only accumulate; the
         step's first call attaches the bucket buffers as the gradients."""
-        self._active = self._count if last_microbatch else _skip
+        self._active = GradReducer._count if last_microbatch else _skip
         for b in self.buckets:
             if b.params[0].grad is None:
                 b.attach()
@@ -147,15 +154,15 @@ class GradReducer:
         if last_microbatch:
             self.clock.begin()
 
-    def _hook(self, bucket: _Bucket, p: Tensor) -> None:
-        self._active(bucket, p)
+    def _hook(self, index: int, p: Tensor) -> None:
+        self._active(self, self.buckets[index], p)
 
     def _count(self, bucket: _Bucket, p: Tensor) -> None:
         bucket.pending -= 1
         if bucket.pending == 0:
-            self._drain()
+            self._launch_ready()
 
-    def _drain(self) -> None:
+    def _launch_ready(self) -> None:
         """Launch the complete buckets in bucket order (the same on every rank)."""
         while self.next < len(self.buckets) and self.buckets[self.next].pending == 0:
             self._launch(self.buckets[self.next])
@@ -165,20 +172,20 @@ class GradReducer:
         bucket.gather()
         buf = bucket.reduced_buffer()
         bucket.work = dist.all_reduce(buf, group=self.group, async_op=True)
-        if bucket.reduce_dtype is not None:
+        if bucket.reduce_dtype is not None and not bucket.narrow:
             self.widened.append(bucket)
             while len(self.widened) > WIDE_AHEAD:
-                self._land(self.widened.pop(0))
+                self._wait_bucket(self.widened.pop(0))
 
     @torch.no_grad()
-    def _land(self, bucket: _Bucket) -> None:
+    def _wait_bucket(self, bucket: _Bucket) -> None:
         """The current stream waits for `bucket`'s reduction; its sum lands in the
         gradients (the reduce-dtype copy is released)."""
         if bucket.work is None:
             return
         bucket.work.wait()
         bucket.work = None
-        bucket.land()
+        bucket.copy_back()
         if self.average:
             bucket.flat.div_(self.world)
 
@@ -190,7 +197,7 @@ class GradReducer:
             self._launch(bucket)
         self.next = len(self.buckets)
         for bucket in self.buckets:
-            self._land(bucket)
+            self._wait_bucket(bucket)
         self.widened = []
 
     def finish(self) -> None:
@@ -331,7 +338,7 @@ class AsyncReducer:
         """Track `params` in static buckets; returns the hook body `(p) -> None`
         handing `p.grad` to the reduction, `then(p)` running once it is summed (in
         `reduce_dtype`, default fp32; None: the parameters' dtype), as a gradient of
-        the parameter's dtype."""
+        the parameter's dtype. The hook body holds this reducer weakly."""
         params = [p for p in params if p.requires_grad]
         items = [(p.nbytes, p.dtype) for p in params]
         for idx in plan_buckets(items, self.bucket_bytes):
@@ -341,7 +348,7 @@ class AsyncReducer:
                 slab.add_key(id(p), p.shape, partial(_deliver, p, then))
                 self.slab_of[id(p)] = slab
             self.slabs.append(slab)
-        return self.add_param
+        return weak_method(self.add_param)
 
     def watch(self, stream) -> None:
         """A stream whose reductions the compute stream waits for at `finish`."""
@@ -385,9 +392,9 @@ class AsyncReducer:
             grad.record_stream(self.stream)
         slab.arrived.add(key)
         if len(slab.arrived) == len(slab.keys):
-            self._drain()
+            self._launch_ready()
 
-    def _drain(self) -> None:
+    def _launch_ready(self) -> None:
         """Launch the complete buckets in bucket order (the same on every rank)."""
         while self.next < len(self.slabs):
             slab = self.slabs[self.next]
@@ -513,12 +520,12 @@ def _sum_hook(state: tuple, bucket):
     wide = buf if reduce_dtype in (None, buf.dtype) else buf.to(reduce_dtype)
     fut = dist.all_reduce(wide, group=group, async_op=True).get_future()
 
-    def land(done) -> Tensor:
+    def copy_back(done) -> Tensor:
         if wide is not buf:
             buf.copy_(wide)
         return buf
 
-    return fut.then(land)
+    return fut.then(copy_back)
 
 
 def wrap_torch_ddp(
@@ -541,17 +548,11 @@ def wrap_torch_ddp(
 
 def _chunks(tensors: list[Tensor], limit: int | None) -> list[list[Tensor]]:
     """Consecutive runs of `tensors` of at most `limit` bytes (one run when None)."""
-    if limit is None:
-        return [tensors]
-    out, current, size = [], [], 0
-    for t in tensors:
-        n = t.nbytes
-        if current and size + n > limit:
-            out.append(current)
-            current, size = [], 0
-        current.append(t)
-        size += n
-    return out + ([current] if current else [])
+    return runs_within(tensors, _nbytes, limit)
+
+
+def _nbytes(t: Tensor) -> int:
+    return t.nbytes
 
 
 @torch.no_grad()
@@ -575,9 +576,3 @@ def broadcast_params(
                 flat.copy_(sent)
             for t, v in zip(part, _unflatten_dense_tensors(flat, part)):
                 t.copy_(v)
-
-
-def all_reduce_sum(t: Tensor, group=None) -> Tensor:
-    """In-place SUM all-reduce (token counts, loss sums)."""
-    dist.all_reduce(t, group=group)
-    return t

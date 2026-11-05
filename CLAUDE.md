@@ -97,7 +97,6 @@ op computes. Every other backend equals it within the precision bar, forward and
 - **No fp64 anywhere in the trainer, the model, the kernels or inference.** fp64 exists only
   as the precision reference (tests, `kohakumoss_kernels.error_stats`, benches, the eager
   reference run on fp64 inputs), never an fp64 tensor or an fp64 register.
-  `tests/rules/test_no_fp64.py` enforces it.
 - **fp32 is for vector operations only.** Every matmul (linear layers incl. the KEEP_FP32
   conditioning modules, attention QK^T / PV, adapter products, the text encoder) runs on
   fp16 / bf16 inputs with fp32 accumulation, the GPU default: no fp32 / tf32 matmuls and no
@@ -180,7 +179,7 @@ Local machine notes live in `CLAUDE.local.md`, plans in `plans/`, live state in 
 ## Development Setup
 
 ```bash
-uv pip install -e ".[cuda,dev]"    # or ".[xpu,dev]"; extras: kernels, lightning, quant, parquet, board, wandb, bench, baselines
+uv pip install -e ".[cuda,dev]"    # or ".[xpu,dev]"; extras: kernels, quant, parquet, gbc, wandb, bench, baselines
 uv pip install -e scripts/bench/matrix    # the bench matrix dev package (kohakumoss-bench), not in the wheel
 kogine run scripts/train/moss.py --config configs/moss/recipes/recipes_lora_24g_bf16.py
 ```

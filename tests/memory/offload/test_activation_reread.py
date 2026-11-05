@@ -44,7 +44,7 @@ class _Device:
 def _engine(monkeypatch) -> ActivationOffload:
     off = ActivationOffload("cpu", min_bytes=0)
     off.dm, off.h2d_stream, off.d2h_stream = _Device(), _Stream(), _Stream()
-    off._load, off._prefetch = off._load_device, nothing
+    off._load, off._prefetch = ActivationOffload._load_device, nothing
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
     return off
 
@@ -68,14 +68,14 @@ def check_reread(off: ActivationOffload) -> None:
 
 def _early_release(self, pk: Packet) -> torch.Tensor:
     """The device copy dropped once `users` reads happened, re-fetched on another."""
-    if pk.gpu is None:
+    if pk.device_copy is None:
         self.pending.setdefault(pk.block, []).append(pk)
         self._fetch(pk.block)
-    gpu = pk.gpu
+    copy = pk.device_copy
     pk.users -= 1
     if pk.users == 0:
-        pk.gpu = None
-    return gpu
+        pk.device_copy = None
+    return copy
 
 
 def test_second_unpack_reads_the_packet_not_the_recycled_buffer(monkeypatch):

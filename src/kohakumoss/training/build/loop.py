@@ -5,20 +5,20 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-import torch.distributed as dist
-
 from kohakumoss.diffusion.objective import WEIGHTINGS, TokenNormalizer
 from kohakumoss.diffusion.timestep import TIMESTEPS
 from kohakumoss.inference.pipeline import MossPipeline
-from kohakumoss.logging.log import interactive, progress_enabled
+from kohakumoss.logging.log import get_logger, interactive, progress_enabled
 from kohakumoss.memory.device_use import NoDeviceUse
 from kohakumoss.memory.release import release_callbacks
 from kohakumoss.memory.timeline import NoTimeline
 from kohakumoss.parallel.launch import dist_rank, ranks_meet
+from kohakumoss.training.build.anchors import start_anchors
 from kohakumoss.training.build.objective import build_loss, is_masked
 from kohakumoss.training.build.pipelines import filter_groups
 from kohakumoss.training.callbacks import (
     CallbackRunner,
+    FeedWait,
     InstabilityDump,
     LogMetrics,
     SampleGrid,
@@ -39,8 +39,9 @@ from kohakumoss.training.callbacks.kernels import (
     speed_callbacks,
     vram_callbacks,
 )
+from kohakumoss.training.callbacks.monitor import job_counts
 from kohakumoss.training.callbacks.progress import ProgressBar
-from kohakumoss.training.callbacks.repro import StepRecorder, no_record
+from kohakumoss.training.callbacks.repro import StepRecorder
 from kohakumoss.training.callbacks.runner import MeetRanks, rank0_decision
 from kohakumoss.training.callbacks.startup import StepOneBreakdown
 from kohakumoss.training.callbacks.transfer import TransferStats, transfer_sources
@@ -49,8 +50,12 @@ from kohakumoss.training.context import RunContext
 from kohakumoss.training.drivers import Parts
 from kohakumoss.training.ema import build_ema, ema_is_power
 from kohakumoss.training.ema.averagers import BackgroundEMA, NoEMA, host_averaged
+from kohakumoss.training.grad_probe import build_probe
 from kohakumoss.training.knobs import is_full
 from kohakumoss.training.memory.optimizers import build_memory_optim
+from kohakumoss.training.optim.bundle.deferred import sync_cadence
+from kohakumoss.training.optim.bundle.nonfinite import param_names
+from kohakumoss.training.optim.outlier import attach_outlier_decay, start_refs
 from kohakumoss.training.step import (
     DeviceBatcher,
     OnlineLatents,
@@ -58,12 +63,16 @@ from kohakumoss.training.step import (
     TrainStep,
     token_counter,
 )
+from kohakumoss.training.stream_loss import build_penalty
 from kohakumoss.training.textenc import TextAhead
 from kohakumoss.training.vae import LatentAhead
 from kohakumoss_common.calls import nothing
 from kohakumoss_common.registry import build
 from kohakumoss_data import CacheWriter, DataConfig
+from kohakumoss_kernels.dist import initialized
 from kohakumoss_kernels.tuning.window import tuning_window
+
+log = get_logger(__name__)
 
 
 def build_step(
@@ -73,23 +82,37 @@ def build_step(
     autocast,
     device,
     sampler=None,
-    stream_rank: int = 0,
+    data_rank: int = 0,
     recorder=None,
     forward=None,
+    penalty: bool = True,
 ):
     """TrainStep with the loss, weighting, sampler and mask handling bound; its sigma /
-    noise streams are those of `stream_rank`; `recorder` (a StepRecorder) keeps each
+    noise streams are those of `data_rank`; `recorder` (a StepRecorder) keeps each
     prepared micro-batch; `forward` is the module the step calls instead of the
-    backbone (the backbone under torch DDP)."""
+    backbone (the backbone under torch DDP); `penalty` adds STREAM_LOSS (the
+    training step; validation steps report the plain loss), and with it the teacher
+    term and HARD_WEIGHT."""
     masked = is_masked(k)
     loss = build_loss(k, built)
     sampler = sampler or build(
         {"name": k["TIMESTEP"], **k["TIMESTEP_KWARGS"]}, TIMESTEPS
     )
+    weighting = k.get("WEIGHTING", "none")
+    extra = {}
+    if penalty:
+        extra = {
+            "teacher": built.teacher,
+            "hard_weight": k.get("HARD_WEIGHT", 1.0),
+            "distill_weight": k.get("DISTILL_WEIGHT", 0.0),
+            "distill_weighting": build(
+                k.get("DISTILL_WEIGHTING") or weighting, WEIGHTINGS
+            ),
+        }
     return TrainStep(
         backbone=built.backbone if forward is None else forward,
         loss_fn=loss,
-        weighting=build(k.get("WEIGHTING", "none"), WEIGHTINGS),
+        weighting=build(weighting, WEIGHTINGS),
         sampler=sampler,
         normalizer=normalizer,
         autocast=autocast,
@@ -97,8 +120,11 @@ def build_step(
         seed=k["SEED"],
         masked=masked,
         pre_forward=built.trainable.begin_step,
-        rank=stream_rank,
+        rank=data_rank,
         keep=None if recorder is None else recorder.keep,
+        penalty=build_penalty(k, built.backbone) if penalty else None,
+        probe=build_probe(k, built.backbone) if penalty else None,
+        **extra,
     )
 
 
@@ -118,8 +144,11 @@ def build_batcher(
     `latent_ahead` when given);
     `writer` (a CacheWriter) receives every fresh encoding. With an `online` cache,
     fresh encodings are rounded as `dataset`'s cache stores them, so a miss trains on
-    what a later hit returns."""
+    what a later hit returns. Under the encode feed every batch arrives encoded (the
+    feed rounds and writes), so the batcher only moves it."""
     kw = {"masked": is_masked(k)}
+    if built.feed is not None:
+        return DeviceBatcher(device, built.backbone.cfg.rope_axes, **kw)
     if k["TEXT_CACHE"] != "offline":
         rounding = (
             {"as_cached": dataset.texts.as_cached}
@@ -148,17 +177,35 @@ def build_ahead(k: dict, built, loader):
     per TEXT_ENCODE['ahead'] host batches), else None."""
     if k["TEXT_CACHE"] == "offline" or built.text_encoder is None:
         return None
-    n = getattr(built.text_encoder, "plan", None)
-    n = 1 if n is None else n.ahead
-    return TextAhead(loader, built.text_encoder.encode, n)
+    plan = getattr(built.text_encoder, "plan", None)
+    n = 1 if plan is None else plan.ahead
+    on_host = plan is not None and plan.memory == "cpu"
+    report = (
+        partial(host_pass_line, "text encoder", "prompts", n) if on_host else nothing
+    )
+    return TextAhead(loader, built.text_encoder.encode, n, report)
 
 
 def build_latent_ahead(k: dict, built, loader):
     """The latent encode-ahead wrapper when latents are encoded online by a placed VAE
     (one VAE pass per VAE_ENCODE['ahead'] host batches), else None."""
-    if k["LATENT_CACHE"] == "offline" or not hasattr(built.vae, "encode_batches"):
+    if k["LATENT_CACHE"] == "offline" or built.feed is not None:
         return None
-    return LatentAhead(loader, built.vae, built.vae.plan.ahead)
+    if not hasattr(built.vae, "encode_batches"):
+        return None
+    n = built.vae.plan.ahead
+    on_host = built.vae.plan.memory == "cpu"
+    report = partial(host_pass_line, "VAE", "images", n) if on_host else nothing
+    return LatentAhead(loader, built.vae, n, report)
+
+
+def host_pass_line(what: str, unit: str, n: int, seconds: float, count: int) -> None:
+    """The one INFO line of an encoder that encodes online on the host: what its first
+    encode-ahead pass cost."""
+    log.info(
+        f"{what} on the host encodes online: the first pass ({count} {unit}, {n} host "
+        f"batches) took {seconds:.1f} s, about {seconds / n:.1f} s per step"
+    )
 
 
 def build_writer(k: dict, loader, writes: bool, rank: int = 0):
@@ -171,9 +218,19 @@ def build_writer(k: dict, loader, writes: bool, rank: int = 0):
     return CacheWriter(loader.dataset, rank=rank)
 
 
-def build_optim(k: dict, built, device, prec, hooks, keep: set[int] | None = None):
+def build_optim(
+    k: dict,
+    built,
+    device,
+    prec,
+    hooks,
+    keep: set[int] | None = None,
+    resumed: bool = False,
+):
     """(bundle, accumulate-context) over the trainable groups (restricted to the
-    parameter ids in `keep` for pipeline stages) under the memory plan's wiring."""
+    parameter ids in `keep` for pipeline stages) under the memory plan's wiring;
+    WD_TARGET 'start' anchors the decay at the run's start weights and OUTLIER_DECAY
+    takes their RMS (`resumed`: the live weights are not yet restored)."""
     hyper = {
         "lr": k["LR"],
         "betas": tuple(k["BETAS"]),
@@ -185,10 +242,12 @@ def build_optim(k: dict, built, device, prec, hooks, keep: set[int] | None = Non
         weight_decay=k["WEIGHT_DECAY"],
         rules=k["WD_RULES"],
         use_muon=k["OPTIMIZER"] == "muon",
+        anchors=start_anchors(k, built.trainable, resumed),
     )
     if keep is not None:
         groups = filter_groups(groups, keep)
-    return build_memory_optim(
+    refs = start_refs(k, built.trainable, resumed)
+    bundle, accumulate = build_memory_optim(
         groups,
         built.plan,
         built.engines,
@@ -200,15 +259,25 @@ def build_optim(k: dict, built, device, prec, hooks, keep: set[int] | None = Non
         prec,
         k["GRAD_CLIP"],
         hooks,
+        sync_every=step_sync_every(k),
     )
+    attach_outlier_decay(bundle, k, refs, param_names(groups))
+    return bundle, accumulate
+
+
+def step_sync_every(k: dict) -> int:
+    """STEP_SYNC 'deferred': the steps between the optimiser's host syncs (every step the
+    console line or a metric row reads); 'step': 0 (a sync every step)."""
+    if k.get("STEP_SYNC", "step") != "deferred":
+        return 0
+    return sync_cadence(k["LOG_EVERY"], metrics_every(k))
 
 
 def build_ema_for(k: dict, built, bundle, names: set[str] | None = None, rank: int = 0):
     """EMA over the trainable set (only `names` when given: pipeline stages), each
     average on its parameter's device (host masters: host); its update first waits for
-    the bundle's in-backward block write-back (`ema_wait`). Under DDP only rank 0 keeps
-    one (every rank holds the same parameters after the reduction; rank 0 saves);
-    host averages update in the background (`BackgroundEMA`)."""
+    the bundle's in-backward block write-back (`ema_before_read`). Under DDP only rank
+    0 keeps one; host averages update in the background (`BackgroundEMA`)."""
     if k.get("PARALLEL", "none") == "ddp" and rank != 0:
         return NoEMA()
     named = list(built.trainable.named_trainable())
@@ -217,11 +286,11 @@ def build_ema_for(k: dict, built, bundle, names: set[str] | None = None, rank: i
     ema = build_ema(named, k["EMA"])
     if host_averaged(ema):
         ema = BackgroundEMA(ema)
-    ema.wait = ema_wait(bundle)
+    ema.before_read = ema_before_read(bundle)
     return ema
 
 
-def ema_wait(bundle) -> Callable[[], None]:
+def ema_before_read(bundle) -> Callable[[], None]:
     """What the EMA waits for before reading the masters: the per-block optimiser's
     write-back to the host masters (`StreamedAdamW.synchronize`), else nothing."""
     blocks = getattr(bundle, "blocks", None)
@@ -251,6 +320,7 @@ def sample_settings(k: dict, embeds: list | None = None) -> dict:
         "shift": k["SAMPLE_SHIFT"],
         "skip_layers": list(k["SAMPLE_SKIP_LAYERS"]),
         "seeds": [seeds[i % len(seeds)] for i in range(len(prompts))],
+        "batch": k.get("SAMPLE_BATCH", 4),
     }
 
 
@@ -263,13 +333,13 @@ class PipelineImages:
     def __init__(self, pipe, autocast=contextlib.nullcontext):
         self.pipe = pipe
         self.autocast = autocast
-        self.run = self._first
+        self._run = PipelineImages._first
 
     def __call__(self, **settings) -> list:
-        return self.run(**settings)
+        return self._run(self, **settings)
 
     def _first(self, **settings) -> list:
-        self.run = self._later
+        self._run = PipelineImages._later
         with tuning_window() as close:
             user = settings.get("step_callback")
             settings["step_callback"] = partial(_closing, close, user)
@@ -297,6 +367,35 @@ def bar_shown(k: dict) -> bool:
     """Whether the run shows the progress bar (PROGRESS, a TTY or FORCE_COLOR, the
     level at INFO or lower); without it the console gets StepLine."""
     return bool(k.get("PROGRESS", True)) and interactive() and progress_enabled()
+
+
+def detail_callbacks(k: dict, built, bundle, rows: int, text, vae, device) -> list:
+    """METRICS_LEVEL 'bench' / 'debug': the weight-transfer, text-encoder, VAE and
+    encode-feed shares of each metric row; 'train': none."""
+    if k["METRICS_LEVEL"] == "train":
+        return []
+    cbs = []
+    sources = transfer_sources(built.engines, bundle)
+    if sources:
+        cbs.append(TransferStats(rows, sources))
+    if hasattr(text, "stats"):
+        cbs.append(TextEncodeStats(rows, text, device))
+    if hasattr(vae, "stats"):
+        cbs.append(VaeEncodeStats(rows, vae))
+    if built.feed is not None:
+        cbs.append(FeedWait(rows, built.feed))
+    return cbs
+
+
+def vram_metric_callbacks(level: str, rows: int, timeline, device_use) -> list:
+    """The VRAM metric rows of METRICS_LEVEL: 'train' none, 'bench' the peaks and the
+    per-phase timeline, 'debug' also the device-use breakdown (and its step-1 log)."""
+    match level:
+        case "train":
+            return []
+        case "bench":
+            return [Vram(rows, timeline, NoDeviceUse())]
+    return [Vram(rows, timeline, device_use), VramAtStepOne(device_use)]
 
 
 def build_callbacks(
@@ -331,22 +430,22 @@ def build_callbacks(
     mode = "full" if is_full(k) else "adapter"
     recompute = getattr(built.plan, "checkpoint", "none") != "none"
     cbs = retune_callbacks(k) + [DecisionsLive()] + speed_callbacks(k)
-    cbs.append(StepOneBreakdown(built.text_encoder, built.vae, output_dir, device))
-    cbs.append(Throughput(rows, built.backbone.cfg, mode, recompute, device))
-    sources = transfer_sources(built.engines, bundle)
-    if sources:
-        cbs.append(TransferStats(rows, sources))
-    if hasattr(built.text_encoder, "stats"):
-        cbs.append(TextEncodeStats(rows, built.text_encoder, device))
-    if hasattr(built.vae, "stats"):
-        cbs.append(VaeEncodeStats(rows, built.vae))
+    text, vae = encode_stats(built)
+    level = k["METRICS_LEVEL"]
+    cbs.append(StepOneBreakdown(text, vae, output_dir, device))
+    job = job_counts(device, ctx.data_world)
+    cbs.append(Throughput(rows, built.backbone.cfg, mode, recompute, device, job))
+    cbs += detail_callbacks(k, built, bundle, rows, text, vae, device)
     cbs += vram_callbacks(k, device)
-    cbs += release_callbacks(device, rows, k["STEP_RELEASE"])
-    cbs.append(Vram(rows, timeline, device_use))
-    cbs.append(VramAtStepOne(device_use))
+    cbs += release_callbacks(device, rows, k["STEP_RELEASE"], level != "train")
+    cbs += vram_metric_callbacks(level, rows, timeline, device_use)
     if k["SAMPLE_EVERY"] > 0 and is_main:
         pipe = MossPipeline.from_components(
-            built.backbone, built.text_encoder, built.vae
+            built.backbone,
+            built.text_encoder,
+            built.vae,
+            memory_plan=built.plan,
+            weight_stream=built.engines.weight_stream,
         )
         cbs.append(
             SampleGrid(
@@ -357,10 +456,13 @@ def build_callbacks(
                 logger,
                 built.backbone,
                 modes,
+                k.get("SAMPLE_COLUMNS", 0),
+                k.get("SAMPLE_AT_START", False),
             )
         )
     if k["SAMPLE_EVERY"] > 0 and dist_rank()[1] > 1:
-        cbs.append(MeetRanks(k["SAMPLE_EVERY"], "sampled", ranks_meet))
+        start = k.get("SAMPLE_AT_START", False)
+        cbs.append(MeetRanks(k["SAMPLE_EVERY"], "sampled", ranks_meet, start))
     if k["VALIDATE_EVERY"] > 0:
         cbs.append(
             Validation(
@@ -375,16 +477,17 @@ def build_callbacks(
                 end_step=built.trainable.end_step,
             )
         )
-    cbs.append(InstabilityDump(output_dir, bundle=bundle))
+    synced_every = step_sync_every(k) or 1
+    cbs.append(InstabilityDump(output_dir, bundle=bundle, every=synced_every))
     shown = bar_shown(k)
     if is_main and not shown:
         cbs.append(StepLine(every))
     cbs += list(rank_callbacks)
-    cbs.append(LogMetrics(rows, logger))
+    cbs.append(LogMetrics(rows, logger, level))
     if k["NONFINITE_PATIENCE"] > 0:
         floor = getattr(bundle.scaler, "floor", bundle.scaler.scale)
         dump = str(Path(output_dir) / "instability")
-        record = no_record if recorder is None else recorder.write
+        record = nothing if recorder is None else recorder.write
         forget = nothing if recorder is None else recorder.drop
         cbs.append(NonFiniteGuard(k["NONFINITE_PATIENCE"], floor, dump, record, forget))
     if is_main and shown:
@@ -392,11 +495,7 @@ def build_callbacks(
     if k["SAVE_EVERY"] > 0:
         cbs.append(SaveCheckpoint(k["SAVE_EVERY"], checkpoints, parts))
     if k["SAVE_MINUTES"] > 0:
-        agree = (
-            {"agree": rank0_decision}
-            if dist.is_available() and dist.is_initialized()
-            else {}
-        )
+        agree = {"agree": rank0_decision} if initialized() else {}
         cbs.append(
             TimedCheckpoint(
                 k["SAVE_MINUTES"], checkpoints, parts, every=k["LOG_EVERY"], **agree
@@ -405,12 +504,30 @@ def build_callbacks(
     return CallbackRunner(cbs, last=k["STEPS"])
 
 
+def encode_stats(built) -> tuple:
+    """(text, VAE) objects whose `stats` the encode callbacks read: the built encoders,
+    or the encode feed's statistics under the feed."""
+    if built.feed is not None:
+        return built.feed.text, built.feed.vae
+    return built.text_encoder, built.vae
+
+
 def validation_data_config(k: dict):
     """The validation set's DataConfig: the run's data knobs over VALIDATION['datasets'],
-    every sample conditional (no text dropout)."""
+    every sample conditional."""
     return DataConfig.from_knobs(
         {**k, "DATASETS": k["VALIDATION"]["datasets"], "TEXT_DROP": 0.0}
     )
+
+
+def final_checkpoint(k: dict) -> bool:
+    """Whether the run ends with a resume checkpoint: FINAL_CHECKPOINT, where "auto" is
+    on when periodic checkpoints are (SAVE_EVERY or SAVE_MINUTES > 0)."""
+    match k.get("FINAL_CHECKPOINT", "auto"):
+        case "auto":
+            return k["SAVE_EVERY"] > 0 or k["SAVE_MINUTES"] > 0
+        case choice:
+            return bool(choice)
 
 
 def build_checkpoints(
@@ -422,6 +539,7 @@ def build_checkpoints(
     return CheckpointManager(
         output_dir,
         k["KEEP_LAST"],
+        final=final_checkpoint(k),
         snapshot_ema=ema_is_power(ema),
         is_main=is_main,
         rank=rank,
