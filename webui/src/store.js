@@ -287,27 +287,66 @@ export async function savePreset(name) {
   }
 }
 
+const LAYER_KEYS = ['algo', 'data', 'vram', 'precision']
+
+// 存档里的旋钮值 -> 表单显示值:v2 存的是提交值,老版扁平存档存的是后端原值
+function formValue(field, v, nested) {
+  if (!nested) return typeof v === 'string' ? v : display(field.type, v)
+  if (field.type === 'lines' && Array.isArray(v)) return v.join('\n')
+  if (field.type === 'pixels' && Number.isFinite(+v)) return display('pixels', +v)
+  return v
+}
+
+// 把一份表单存档写回训练页;认 v2 的 {layers, knobs} 与老版扁平两种格式
+async function applyForm(data, label) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('不是 JSON 对象')
+  const nested = !!(data.layers || data.knobs)
+  const knobs = nested ? (data.knobs || {}) : data
+  const layers = nested ? (data.layers || {})
+    : Object.fromEntries(LAYER_KEYS.filter(k => k in data).map(k => [k, String(data[k])]))
+  store.layers = { ...store.layers, ...layers }
+  store.dirty = {}
+  await recompose()
+  const form = { ...store.form }
+  const dirty = {}
+  for (const field of KNOB_FIELDS) {
+    const v = field.key in knobs ? knobs[field.key] : getKnob(knobs, field.key)
+    if (v === undefined) continue
+    form[field.key] = formValue(field, v, nested)
+    if (form[field.key] !== store.defaults[field.key]) dirty[field.key] = true
+  }
+  const datasets = Array.isArray(data.datasets) ? data.datasets.filter(d => String(d?.path ?? '').trim())
+    .map(d => ({ path: String(d.path).trim(), weight: String(d.weight ?? '1') })) : []
+  Object.assign(store, { form, dirty, lowRam: !!data.low_ram, page: 'train' })
+  if ('prepare' in data) store.prepare = data.prepare !== false
+  store.datasets = datasets.length ? datasets : [{ path: '', weight: '1' }]
+  toast('info', '已载入 · ' + label)
+}
+
 export async function applyPreset(name) {
   try {
-    const f = await getJson('/api/v1/presets/' + encodeURIComponent(name))
-    store.layers = { ...store.layers, ...f.layers }
-    store.dirty = {}
-    await recompose()
-    const form = { ...store.form }
-    const dirty = {}
-    for (const field of KNOB_FIELDS) {
-      if (!(field.key in (f.knobs || {}))) continue
-      const v = f.knobs[field.key]
-      if (field.type === 'lines' && Array.isArray(v)) form[field.key] = v.join('\n')
-      else if (field.type === 'pixels' && Number.isFinite(+v)) form[field.key] = display('pixels', +v)
-      else form[field.key] = v
-      dirty[field.key] = true
-    }
-    Object.assign(store, { form, dirty, lowRam: !!f.low_ram, page: 'train' })
-    store.datasets = f.datasets?.length ? f.datasets : [{ path: '', weight: '1' }]
-    toast('info', '已载入预设 · ' + name)
+    await applyForm(await getJson('/api/v1/presets/' + encodeURIComponent(name)), '预设 ' + name)
   } catch (err) {
     toast('error', '载入失败 · ' + err.message)
+  }
+}
+
+// 导出:当前表单下载到浏览器这台电脑(与预设同格式)
+export function exportForm() {
+  const text = JSON.stringify(trainForm(), null, 1) + '\n'
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }))
+  a.download = (store.form.RUN_NAME || 'config') + '.json'
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+}
+
+// 导入:从浏览器这台电脑选一个 .json(v2 或老版格式)
+export async function importForm(file) {
+  try {
+    await applyForm(JSON.parse(await file.text()), file.name)
+  } catch (err) {
+    toast('error', '导入失败 · ' + err.message)
   }
 }
 

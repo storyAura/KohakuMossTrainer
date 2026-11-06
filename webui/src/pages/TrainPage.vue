@@ -2,8 +2,11 @@
 // 训练页:顶部吸附工具条(分组跳转、改动数、实时校验),左侧分组参数卡(fields.js),
 // 右侧监控栏(进度/显存、loss 曲线、样图、终端)。<1200px 时监控栏折叠为标签页。
 // 监控来源:本页作业进行中时看作业,否则看磁盘上的运行(命令行启动的也算,watch.js)。
-import { computed } from 'vue'
-import { store, clock, jobActive, setField, setLayer, resetField, resetAll, showConfig, togglePin } from '../store.js'
+import { computed, ref } from 'vue'
+import {
+  store, clock, jobActive, setField, setLayer, resetField, resetAll, showConfig, togglePin,
+  savePreset, exportForm, importForm, toast,
+} from '../store.js'
 import { setWatch } from '../watch.js'
 import { fileUrl } from '../api.js'
 import { GROUPS } from '../fields.js'
@@ -15,6 +18,19 @@ import LossChart from '../components/LossChart.vue'
 import TerminalPanel from '../components/TerminalPanel.vue'
 
 const CONTROL = { lines: 'area', list: 'text', pixels: 'num' }
+
+// 保存 / 导入:按运行名存成预设;选中的本机文件写回表单
+const picker = ref(null)
+function saveCurrent() {
+  const name = (store.form.RUN_NAME || '').trim()
+  if (name) savePreset(name)
+  else toast('warn', '先填写运行名')
+}
+function onPick(ev) {
+  const file = ev.target.files?.[0]
+  if (file) importForm(file)
+  ev.target.value = ''
+}
 const fileOptions = part => [{ v: '', label: '自动' }, ...(store.weightFiles[part] || []).map(v => ({ v }))]
 const weightOptions = () => store.weightDirs.map(w => ({
   v: w.path, label: w.path, hint: (w.kind === 'hf' ? 'HF' : 'ComfyUI') + (w.moss ? '' : ' · 无 MOSS'),
@@ -167,6 +183,10 @@ const termAway = computed(() => store.termPinned || store.termFull)
           <Icon :name="check.icon" :size="12" />{{ check.text }}
         </button>
         <button @click="showConfig" class="btn btn-sm"><Icon name="file" :size="14" />查看配置</button>
+        <button @click="saveCurrent" class="btn btn-sm" :disabled="!store.env.backend" data-tip="按运行名保存为预设(训练机上)"><Icon name="bookmark" :size="14" />保存</button>
+        <button @click="exportForm" class="btn btn-sm" data-tip="下载到本机"><Icon name="download" :size="14" />导出</button>
+        <button @click="picker.click()" class="btn btn-sm" data-tip="从本机选 .json"><Icon name="folder" :size="14" />导入</button>
+        <input ref="picker" type="file" accept=".json,application/json" @change="onPick" hidden />
       </div>
     </div>
 
