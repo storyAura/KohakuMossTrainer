@@ -37,6 +37,11 @@ def test_own_knobs_keeps_only_changes():
     own = forms.own_knobs(base, {"LR": "1e-4", "SCHEDULE.warmup": "50", "DIM": "16"})
     assert own == {"SCHEDULE": {"mode": "cosine", "warmup": 50}, "DIM": 16}
     assert base["SCHEDULE"]["warmup"] == 100
+    nl = {"CAPTION": {"template": "nl"}}
+    assert (
+        forms.own_knobs(nl, {"CAPTION.shuffle": False, "CAPTION.tag_dropout": ""}) == {}
+    )
+    assert "shuffle" in forms.own_knobs(nl, {"CAPTION.shuffle": True})["CAPTION"]
     must_fail(lambda: _assert_no_error(base, {"NOPE": "1"}), "unknown knob")
     must_fail(lambda: _assert_no_error(base, {"LR": "abc"}), "bad float")
 

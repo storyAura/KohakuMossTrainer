@@ -100,6 +100,9 @@ def own_knobs(base: dict, values: dict, own: dict | None = None) -> dict:
         if top not in base:
             raise FormError(f"unknown knob {top}")
         old = dotted(base, key)
+        # a blank form field the composed table does not carry stays out of it
+        if field and old is None and (value is None or value is False or value == ""):
+            continue
         try:
             new = coerce(value, old)
         except (TypeError, ValueError) as err:
