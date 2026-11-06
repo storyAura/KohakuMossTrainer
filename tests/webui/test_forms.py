@@ -46,6 +46,14 @@ def test_own_knobs_keeps_only_changes():
     must_fail(lambda: _assert_no_error(base, {"LR": "abc"}), "bad float")
 
 
+def test_encoder_source_prefers_the_chosen_file(tmp_path):
+    te = tmp_path / "qwen3.5_9b_bf16.safetensors"
+    te.write_bytes(b"")
+    knobs = {"WEIGHTS": str(tmp_path), "TEXT_ENCODER": str(te), "VAE": ""}
+    assert forms.encoder_source(knobs, "text_encoder", "TEXT_ENCODER") == str(te)
+    assert forms.encoder_source(knobs, "vae", "VAE") == str(tmp_path)
+
+
 def _assert_no_error(base: dict, values: dict) -> None:
     with pytest.raises(forms.FormError):
         forms.own_knobs(base, values)
