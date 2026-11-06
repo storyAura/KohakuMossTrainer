@@ -13,7 +13,6 @@ RE_TOTAL = re.compile(r"training from step (\d+) to (\d+)")
 LIVE_S = 120
 TAIL_BYTES = 8192
 DEPTHS = ("*", "*/*", "*/*/*")
-FIELDS = ("step", "time", "loss", "lr")
 
 _totals: dict[str, tuple[int, int]] = {}
 
@@ -82,7 +81,7 @@ def find(roots: list[Path], root: Path, limit: int = 30) -> list[dict]:
 
 
 def rows_after(run: Path, offset: int) -> dict:
-    """The metric rows (FIELDS only) of the complete lines past byte `offset`, the new
+    """The metric rows (numeric fields only) of the complete lines past byte `offset`, the new
     offset, and `reset` when the file is shorter than `offset` (a fresh run moved the
     old one aside; the rows then start from byte 0)."""
     path = run / METRICS
@@ -99,5 +98,5 @@ def rows_after(run: Path, offset: int) -> dict:
             row = json.loads(line)
         except ValueError:
             continue
-        rows.append({k: row.get(k) for k in FIELDS})
+        rows.append({k: v for k, v in row.items() if isinstance(v, (int, float))})
     return {"rows": rows, "offset": start + end, "reset": reset}

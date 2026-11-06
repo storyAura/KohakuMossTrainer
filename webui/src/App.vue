@@ -8,6 +8,7 @@ import StatusBadge from './components/StatusBadge.vue'
 import TerminalPanel from './components/TerminalPanel.vue'
 import ModalsHost from './components/ModalsHost.vue'
 import TrainPage from './pages/TrainPage.vue'
+import LossPage from './pages/LossPage.vue'
 import ToolsPage from './pages/ToolsPage.vue'
 import QueuePage from './pages/QueuePage.vue'
 import ArtifactsPage from './pages/ArtifactsPage.vue'
@@ -19,7 +20,7 @@ onMounted(init)
 onUnmounted(destroy)
 
 const PAGES = {
-  train: ['训练', 'train', TrainPage], tools: ['出图', 'image', ToolsPage], queue: ['队列', 'queue', QueuePage],
+  train: ['训练', 'train', TrainPage], loss: ['Loss', 'activity', LossPage], tools: ['出图', 'image', ToolsPage], queue: ['队列', 'queue', QueuePage],
   artifacts: ['产物', 'folder', ArtifactsPage], models: ['模型', 'box', ModelsPage],
   presets: ['预设', 'bookmark', PresetsPage], env: ['环境', 'cpu', EnvironmentPage],
 }

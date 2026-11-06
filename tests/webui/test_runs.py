@@ -42,6 +42,14 @@ def test_rows_after_resets_on_a_fresh_file(tmp_path):
     assert again["reset"] and [r["loss"] for r in again["rows"]] == [0.9]
 
 
+def test_rows_after_keeps_every_numeric_metric(tmp_path):
+    line = {"step": 1, "loss": 0.5, "grad_norm": 0.01, "note": "x"}
+    run = _run(tmp_path, json.dumps(line) + "\n")
+    assert runs.rows_after(run, 0)["rows"] == [
+        {"step": 1, "loss": 0.5, "grad_norm": 0.01}
+    ]
+
+
 def _rows_ignoring_offset(run, offset):
     """The broken variant: every call returns every row."""
     return runs.rows_after(run, 0)
